@@ -1,0 +1,345 @@
+"""UEBA endpoint and end-user tools for FortiAnalyzer.
+
+Read-only readers over the UEBA (User and Entity Behavior Analytics) API,
+added as building blocks for the Wave-2 skills (asset/identity/risk).
+Feature-gated: these endpoints require UEBA to be licensed and enabled on
+the FortiAnalyzer. The API paths are identical on 7.6.7 and 8.0.0.
+
+Based on the FNDN FortiAnalyzer UEBA (ueba.json) API specifications.
+"""
+
+import logging
+from typing import Any
+
+from mcp_fortianalyzer.api.client import FortiAnalyzerClient
+from mcp_fortianalyzer.query.shape import project_payload
+from mcp_fortianalyzer.server import get_faz_client, mcp
+from mcp_fortianalyzer.tool_annotations import READ_ONLY
+from mcp_fortianalyzer.utils.errors import ValidationError
+from mcp_fortianalyzer.utils.responses import error_response, redact
+from mcp_fortianalyzer.utils.time_range import parse_time_range
+from mcp_fortianalyzer.utils.validation import get_default_adom, validate_adom
+
+logger = logging.getLogger(__name__)
+
+_VALID_ENDPOINT_DETAIL = {"simple", "basic", "standard"}
+_VALID_ENDUSER_DETAIL = {"basic", "standard", "extended"}
+_VALID_DETECTBY = {"FortiClient", "FortiGate"}
+
+
+def _vuln_records(payload: Any) -> list[Any]:
+    """Normalize a vulnerability response to a list of per-endpoint records."""
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        data = payload.get("data")
+        return data if isinstance(data, list) else ([payload] if payload else [])
+    return []
+
+
+_VALID_ENDUSER_STATS_ITEM = {"total-count", "new-count"}
+
+
+def _get_client() -> FortiAnalyzerClient:
+    """Get the FortiAnalyzer client instance."""
+    client = get_faz_client()
+    if not client:
+        raise RuntimeError("FortiAnalyzer client not initialized")
+    return client
+
+
+async def _parse_time_range(time_range: str) -> dict[str, str]:
+    """Parse a time-range string, aligning relative presets to FAZ's TZ."""
+    if "|" in time_range:
+        return parse_time_range(time_range)
+    client = _get_client()
+    faz_tz = await client.get_system_timezone()
+    return parse_time_range(time_range, faz_tz=faz_tz)
+
+
+@mcp.tool(annotations=READ_ONLY)
+async def get_endpoints(
+    adom: str | None = None,
+    epids: list[int] | None = None,
+    detail_level: str = "standard",
+    time_range: str | None = None,
+    fields: list[str] | None = None,
+) -> dict[str, Any]:
+    """Get UEBA endpoint (asset) records from FortiAnalyzer.
+
+    Resolves endpoint/asset profiles: name and IP (``epname``/``epip``),
+    the detecting appliance, and the ``user`` association list. Requires
+    UEBA to be enabled/licensed on the FortiAnalyzer.
+
+    Args:
+        adom: ADOM name (default: from config DEFAULT_ADOM)
+        epids: Optional list of endpoint IDs to scope the query
+        detail_level: "simple", "basic" or "standard" (default: "standard")
+        time_range: Optional first-seen window, e.g. "7-day" or a custom
+            "start|end" range
+        fields: Which keys each endpoint record carries. Omit for a curated
+            default (epname/epip identity, the associated-user list, and the
+            epid/euid join keys), ["*"] for the full object, or name the
+            fields you want. "hostname"/"host"/"ip"/"username" are accepted
+            as aliases for the real field names.
+
+    Returns:
+        dict with endpoint records under "data"
+
+    Example:
+        >>> result = await get_endpoints(detail_level="standard")
+        >>> for ep in result["data"]:
+        ...     print(ep.get("epname"), ep.get("epip"))
+    """
+    try:
+        adom = validate_adom(adom or get_default_adom())
+        if detail_level not in _VALID_ENDPOINT_DETAIL:
+            valid = ", ".join(sorted(_VALID_ENDPOINT_DETAIL))
+            return {
+                "status": "error",
+                "message": f"Validation error: Invalid detail_level '{detail_level}'. "
+                f"Must be one of: {valid}",
+            }
+        tr = await _parse_time_range(time_range) if time_range else None
+        client = _get_client()
+
+        logger.info(f"Getting UEBA endpoints from ADOM {adom}")
+
+        result = await client.get_endpoints(
+            adom=adom, epids=epids, detail_level=detail_level, time_range=tr
+        )
+        data, returned, projection_warnings = project_payload("endpoint", result, fields)
+        return {
+            "status": "success",
+            "data": data,
+            "fields_returned": returned,
+            "warnings": projection_warnings,
+        }
+    except ValidationError as e:
+        return error_response(
+            error="validation_error",
+            message=e,
+            operation="get_endpoints",
+            adom=adom,
+        )
+    except Exception as e:
+        logger.error(f"Failed to get UEBA endpoints: {e}")
+        return {"status": "error", "message": redact(str(e))}
+
+
+@mcp.tool(annotations=READ_ONLY)
+async def get_endpoint_vulnerabilities(
+    adom: str | None = None,
+    epids: list[int] | None = None,
+    detectby: str | None = None,
+) -> dict[str, Any]:
+    """Get CVE/vulnerability records for UEBA endpoints.
+
+    Returns the per-endpoint vulnerability list (CVE id, severity, type,
+    description, references) as detected by FortiClient or FortiGate.
+    Requires UEBA to be enabled/licensed on the FortiAnalyzer.
+
+    Args:
+        adom: ADOM name (default: from config DEFAULT_ADOM)
+        epids: Optional list of endpoint IDs to scope the query
+        detectby: Detector filter ("FortiClient" or "FortiGate"). Omitted
+            (the default) queries every detector and returns the combined
+            records, because the appliance returns nothing when the filter
+            is absent.
+
+    Returns:
+        dict with vulnerability records under "data"
+
+    Example:
+        >>> result = await get_endpoint_vulnerabilities(epids=[1025])
+        >>> print(len(result["data"]))
+    """
+    try:
+        adom = validate_adom(adom or get_default_adom())
+        if detectby is not None and detectby not in _VALID_DETECTBY:
+            valid = ", ".join(sorted(_VALID_DETECTBY))
+            return {
+                "status": "error",
+                "message": f"Validation error: Invalid detectby '{detectby}'. "
+                f"Must be one of: {valid}",
+            }
+        client = _get_client()
+
+        logger.info(f"Getting UEBA endpoint vulnerabilities from ADOM {adom}")
+
+        if detectby is None:
+            # The appliance returns nothing when the detector filter is
+            # absent, so an omitted detectby silently read as "no
+            # vulnerabilities" (#87). Query every detector and combine the
+            # per-endpoint records so an omitted filter means "all", not "none".
+            combined: list[Any] = []
+            for det in sorted(_VALID_DETECTBY):
+                recs = await client.get_endpoint_vulnerabilities(
+                    adom=adom, epids=epids, detectby=det
+                )
+                combined.extend(_vuln_records(recs))
+            result: Any = combined
+        else:
+            result = await client.get_endpoint_vulnerabilities(
+                adom=adom, epids=epids, detectby=detectby
+            )
+        return {"status": "success", "data": result}
+    except Exception as e:
+        logger.error(f"Failed to get UEBA endpoint vulnerabilities: {e}")
+        return {"status": "error", "message": redact(str(e))}
+
+
+@mcp.tool(annotations=READ_ONLY)
+async def get_endusers(
+    adom: str | None = None,
+    euids: list[int] | None = None,
+    detail_level: str = "standard",
+    fields: list[str] | None = None,
+) -> dict[str, Any]:
+    """Get UEBA end-user (identity) records from FortiAnalyzer.
+
+    Resolves user identity records keyed on ``euname``. With detail_level
+    "extended", also returns ``email``. Requires UEBA to be enabled/licensed
+    on the FAZ.
+
+    Args:
+        adom: ADOM name (default: from config DEFAULT_ADOM)
+        euids: Optional list of end-user IDs to scope the query
+        detail_level: "basic", "standard" or "extended" (default: "standard")
+        fields: Which keys each end-user record carries. Omit for a curated
+            default (euname identity and the euid/epids join keys), ["*"]
+            for the full object (needed for "email" at detail_level
+            "extended"), or name the fields you want. "username"/"user"
+            are accepted as aliases for "euname".
+
+    Returns:
+        dict with end-user records under "data"
+
+    Example:
+        >>> result = await get_endusers(detail_level="extended")
+        >>> for user in result["data"]:
+        ...     print(user.get("euname"), user.get("email"))
+    """
+    try:
+        adom = validate_adom(adom or get_default_adom())
+        if detail_level not in _VALID_ENDUSER_DETAIL:
+            valid = ", ".join(sorted(_VALID_ENDUSER_DETAIL))
+            return {
+                "status": "error",
+                "message": f"Validation error: Invalid detail_level '{detail_level}'. "
+                f"Must be one of: {valid}",
+            }
+        client = _get_client()
+
+        logger.info(f"Getting UEBA end-users from ADOM {adom}")
+
+        result = await client.get_endusers(adom=adom, euids=euids, detail_level=detail_level)
+        data, returned, projection_warnings = project_payload("enduser", result, fields)
+        return {
+            "status": "success",
+            "data": data,
+            "fields_returned": returned,
+            "warnings": projection_warnings,
+        }
+    except ValidationError as e:
+        return error_response(
+            error="validation_error",
+            message=e,
+            operation="get_endusers",
+            adom=adom,
+        )
+    except Exception as e:
+        logger.error(f"Failed to get UEBA end-users: {e}")
+        return {"status": "error", "message": redact(str(e))}
+
+
+@mcp.tool(annotations=READ_ONLY)
+async def get_endpoint_stats(
+    adom: str | None = None,
+    time_range: str = "7-day",
+    filter: str | None = None,
+) -> dict[str, Any]:
+    """Get ADOM-wide UEBA endpoint (asset) count stats for a window.
+
+    Returns an aggregate count snapshot for the ADOM over the window:
+    total, new, identified and unidentified endpoint counts. This is an
+    estate-scale denominator, NOT a per-endpoint or time-series record.
+    The FortiAnalyzer requires a time window, so one is always sent.
+    Requires UEBA to be enabled/licensed on the FortiAnalyzer.
+
+    Args:
+        adom: ADOM name (default: from config DEFAULT_ADOM)
+        time_range: Window, e.g. "7-day" (default) or a custom "start|end"
+            range. A window is mandatory for this endpoint.
+        filter: Optional query filter, e.g. "category=IOT"
+
+    Returns:
+        dict with the aggregate stat record(s) under "data"
+
+    Example:
+        >>> result = await get_endpoint_stats(time_range="7-day")
+        >>> print(result["data"][0]["total-count"])
+    """
+    try:
+        adom = validate_adom(adom or get_default_adom())
+        tr = await _parse_time_range(time_range)
+        client = _get_client()
+
+        logger.info(f"Getting UEBA endpoint stats from ADOM {adom}")
+
+        result = await client.get_endpoint_stats(adom=adom, time_range=tr, filter=filter)
+        return {"status": "success", "data": result}
+    except Exception as e:
+        logger.error(f"Failed to get UEBA endpoint stats: {e}")
+        return {"status": "error", "message": redact(str(e))}
+
+
+@mcp.tool(annotations=READ_ONLY)
+async def get_enduser_stats(
+    adom: str | None = None,
+    time_range: str = "7-day",
+    stats_item: list[str] | None = None,
+) -> dict[str, Any]:
+    """Get ADOM-wide UEBA end-user (identity) count stats for a window.
+
+    Returns an aggregate count object for the ADOM over the window:
+    total and new end-user counts. This is an estate-scale denominator,
+    NOT a per-user or time-series record. The FortiAnalyzer requires both
+    a window and the requested stat items, so both are always sent.
+    Requires UEBA to be enabled/licensed on the FortiAnalyzer.
+
+    Args:
+        adom: ADOM name (default: from config DEFAULT_ADOM)
+        time_range: Window, e.g. "7-day" (default) or a custom "start|end"
+            range. A window is mandatory for this endpoint.
+        stats_item: Requested stat types (default: ["total-count",
+            "new-count"]); each must be one of "total-count", "new-count".
+
+    Returns:
+        dict with the aggregate stat counts under "data"
+
+    Example:
+        >>> result = await get_enduser_stats(time_range="7-day")
+        >>> print(result["data"]["total-count"])
+    """
+    try:
+        adom = validate_adom(adom or get_default_adom())
+        if stats_item is not None:
+            invalid = [s for s in stats_item if s not in _VALID_ENDUSER_STATS_ITEM]
+            if invalid:
+                valid = ", ".join(sorted(_VALID_ENDUSER_STATS_ITEM))
+                return {
+                    "status": "error",
+                    "message": f"Validation error: Invalid stats_item {invalid}. "
+                    f"Must be one of: {valid}",
+                }
+        tr = await _parse_time_range(time_range)
+        client = _get_client()
+
+        logger.info(f"Getting UEBA end-user stats from ADOM {adom}")
+
+        result = await client.get_enduser_stats(adom=adom, time_range=tr, stats_item=stats_item)
+        return {"status": "success", "data": result}
+    except Exception as e:
+        logger.error(f"Failed to get UEBA end-user stats: {e}")
+        return {"status": "error", "message": redact(str(e))}

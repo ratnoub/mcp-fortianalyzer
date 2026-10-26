@@ -1,0 +1,365 @@
+"""Incident management tools for FortiAnalyzer.
+
+Based on FNDN FortiAnalyzer 7.6.4 Incident Management API specifications.
+Provides incident creation, tracking, and SOC workflow operations.
+"""
+
+import logging
+from typing import Any
+
+from mcp_fortianalyzer.api.client import FortiAnalyzerClient
+from mcp_fortianalyzer.query.shape import project_payload
+from mcp_fortianalyzer.server import get_faz_client, mcp
+from mcp_fortianalyzer.tool_annotations import DESTRUCTIVE, READ_ONLY
+from mcp_fortianalyzer.utils.responses import error_response, redact
+from mcp_fortianalyzer.utils.time_range import parse_time_range
+from mcp_fortianalyzer.utils.validation import (
+    ValidationError,
+    get_default_adom,
+    validate_adom,
+    validate_incident_id,
+    validate_severity,
+)
+
+# FAZ incident workflow states, from the incidentmgmt spec enum. Verified
+# live on 7.6.7 and 8.0.0: the appliance rejects anything else with
+# "not a valid enum value for 'status'".
+_VALID_INCIDENT_STATUSES = {"draft", "analysis", "response", "closed", "cancelled"}
+
+# The incident spec's severity enum is narrower than the shared
+# VALID_SEVERITIES set (no "critical", no "info").
+_VALID_INCIDENT_SEVERITIES = {"high", "medium", "low"}
+
+logger = logging.getLogger(__name__)
+
+
+def _get_client() -> FortiAnalyzerClient:
+    """Get the FortiAnalyzer client instance."""
+    client = get_faz_client()
+    if not client:
+        raise RuntimeError("FortiAnalyzer client not initialized")
+    return client
+
+
+async def _parse_time_range(time_range: str) -> dict[str, str]:
+    """Parse time range using FAZ system TZ for alignment.
+
+    Custom absolute ranges (``"start|end"``) skip the TZ lookup since
+    the caller is already supplying explicit timestamps. Relative
+    presets pull the cached FAZ timezone off the client so naive
+    timestamps land in FAZ's local TZ.
+    """
+    if "|" in time_range:
+        return parse_time_range(time_range)
+    client = _get_client()
+    faz_tz = await client.get_system_timezone()
+    return parse_time_range(time_range, faz_tz=faz_tz)
+
+
+@mcp.tool(annotations=READ_ONLY)
+async def get_incidents(
+    adom: str | None = None,
+    time_range: str = "7-day",
+    filter: str | None = None,
+    limit: int = 100,
+    offset: int = 0,
+    fields: list[str] | None = None,
+) -> dict[str, Any]:
+    """Get security incidents from FortiAnalyzer.
+
+    Retrieves incidents from the incident management module.
+    Incidents can be created manually or automatically from alerts.
+
+    The time window IS applied, though FortiAnalyzer does not document
+    ``time-range`` on this endpoint. Verified on 7.6.6: a window covering an
+    incident's createtime returns it, windows in 2000 and 2099 return
+    nothing, and omitting the window returns everything — the same pattern
+    the documented ``/incident/stats`` gives. Each record also carries
+    ``createtime`` and ``lastupdate``.
+
+    Args:
+        adom: ADOM name (default: from config DEFAULT_ADOM)
+        time_range: Time range for incidents. Options:
+            - "1-hour", "6-hour", "12-hour", "24-hour"
+            - "1-day", "7-day", "30-day", "90-day"
+            - Custom: "2024-01-01 00:00:00|2024-01-02 00:00:00"
+        filter: Filter expression (e.g., "severity==high")
+        limit: Maximum number of incidents to return (1-2000)
+        offset: Record offset for pagination
+        fields: Which keys each incident carries. Omit for a curated default
+            (incid/epid/euid/alertid join keys, name, severity, status,
+            category, timing, the `endpoint` the incident is about, and the
+            reporter/lastuser/assigned_to workflow slots), ["*"] for the full
+            object, or name the fields you want. The record spells the title
+            `name` and the owner `assigned_to`; `title`, `banner`, `owner` and
+            `assignee` are accepted as aliases for them.
+
+    Returns:
+        dict with incidents data
+
+    Example:
+        >>> result = await get_incidents(time_range="24-hour", limit=50)
+        >>> print(f"Found {result.get('count', 0)} incidents")
+    """
+    try:
+        adom = validate_adom(adom or get_default_adom())
+        # Enforce the documented 1-2000 range and non-negative offset.
+        limit = max(1, min(limit, 2000))
+        offset = max(0, offset)
+        client = _get_client()
+        tr = await _parse_time_range(time_range)
+
+        logger.info(f"Getting incidents from ADOM {adom}")
+
+        result = await client.get_incidents(
+            adom=adom,
+            time_range=tr,
+            filter=filter,
+            limit=limit,
+            offset=offset,
+        )
+
+        data = result.get("data", []) if isinstance(result, dict) else result
+        if not isinstance(data, list):
+            data = [data] if data else []
+
+        data, returned, projection_warnings = project_payload("incident", data, fields)
+
+        return {
+            "status": "success",
+            "adom": adom,
+            "time_range": tr,
+            "count": len(data),
+            "data": data,
+            "fields_returned": returned,
+            "warnings": projection_warnings,
+        }
+    except ValidationError as e:
+        return error_response(
+            error="validation_error",
+            message=e,
+            operation="get_incidents",
+            adom=adom,
+        )
+    except Exception as e:
+        logger.error(f"Failed to get incidents: {e}")
+        return {"status": "error", "message": redact(str(e))}
+
+
+@mcp.tool(annotations=READ_ONLY)
+async def get_incident(
+    incident_id: str,
+    adom: str | None = None,
+) -> dict[str, Any]:
+    """Get a specific incident by ID.
+
+    Retrieves detailed information about a single incident.
+
+    Args:
+        incident_id: Incident ID to retrieve
+        adom: ADOM name (default: from config DEFAULT_ADOM)
+
+    Returns:
+        dict with incident details
+
+    Example:
+        >>> result = await get_incident("INC-001")
+        >>> print(f"Incident: {result['data']['name']}")
+    """
+    try:
+        adom = validate_adom(adom or get_default_adom())
+        incident_id = validate_incident_id(incident_id)
+        client = _get_client()
+
+        logger.info(f"Getting incident {incident_id} from ADOM {adom}")
+
+        result = await client.get_incident(
+            adom=adom,
+            incident_id=incident_id,
+        )
+
+        return {
+            "status": "success",
+            "adom": adom,
+            "incident_id": incident_id,
+            "data": result,
+        }
+    except Exception as e:
+        logger.error(f"Failed to get incident {incident_id}: {e}")
+        return {"status": "error", "message": redact(str(e))}
+
+
+@mcp.tool(annotations=READ_ONLY)
+async def get_incident_count(
+    adom: str | None = None,
+    time_range: str = "7-day",
+    filter: str | None = None,
+) -> dict[str, Any]:
+    """Get count of incidents matching criteria.
+
+    The time window is applied even though FortiAnalyzer does not document
+    it on this endpoint — see ``get_incidents`` for the measurement.
+
+    Args:
+        adom: ADOM name (default: from config DEFAULT_ADOM)
+        time_range: Time range for incidents
+        filter: Filter expression (optional)
+
+    Returns:
+        dict with incident count
+
+    Example:
+        >>> result = await get_incident_count(time_range="24-hour")
+        >>> print(f"Total incidents: {result['data']['count']}")
+    """
+    try:
+        adom = validate_adom(adom or get_default_adom())
+        client = _get_client()
+        tr = await _parse_time_range(time_range)
+
+        logger.info(f"Getting incident count from ADOM {adom}")
+
+        result = await client.get_incidents_count(
+            adom=adom,
+            time_range=tr,
+            filter=filter,
+        )
+
+        return {
+            "status": "success",
+            "adom": adom,
+            "time_range": tr,
+            "data": result,
+        }
+    except Exception as e:
+        logger.error(f"Failed to get incident count: {e}")
+        return {"status": "error", "message": redact(str(e))}
+
+
+@mcp.tool(annotations=DESTRUCTIVE)
+async def update_incident(
+    incident_id: str,
+    adom: str | None = None,
+    status: str | None = None,
+    severity: str | None = None,
+    last_user: str | None = None,
+) -> dict[str, Any]:
+    """Update an existing incident.
+
+    Modifies incident properties for SOC workflow management.
+
+    There is no assignment/ownership field on this API. This tool used to
+    take an ``assignee``; no such field exists on 7.6.6 or 8.0.0, so it was
+    dropped by the appliance while the call reported success. ``last_user``
+    records who last touched the record, which is the nearest real field --
+    it is an audit stamp, not an assignment.
+
+    Args:
+        incident_id: Incident ID to update
+        adom: ADOM name (default: from config DEFAULT_ADOM)
+        status: New status (optional):
+            - "draft": Draft incident
+            - "analysis": Under analysis
+            - "response": In response
+            - "closed": Incident closed
+            - "cancelled": Incident cancelled
+        severity: New severity (optional)
+        last_user: Username to stamp on the record as last editor (optional)
+
+    Returns:
+        dict with update result
+
+    Example:
+        >>> result = await update_incident(
+        ...     incident_id="INC-001",
+        ...     status="analysis",
+        ...     last_user="analyst1"
+        ... )
+    """
+    try:
+        adom = validate_adom(adom or get_default_adom())
+        incident_id = validate_incident_id(incident_id)
+        if severity is not None:
+            severity = validate_severity(severity)
+        if status is not None and status.lower() not in _VALID_INCIDENT_STATUSES:
+            valid = ", ".join(sorted(_VALID_INCIDENT_STATUSES))
+            return {
+                "status": "error",
+                "message": f"Validation error: Invalid status '{status}'. Must be one of: {valid}",
+            }
+        client = _get_client()
+
+        logger.info(f"Updating incident {incident_id} in ADOM {adom}")
+
+        result = await client.update_incident(
+            adom=adom,
+            incident_id=incident_id,
+            status=status,
+            severity=severity,
+            last_user=last_user,
+        )
+
+        return {
+            "status": "success",
+            "adom": adom,
+            "incident_id": incident_id,
+            "data": result,
+        }
+    except ValidationError as e:
+        return {"status": "error", "message": f"Validation error: {e}"}
+    except Exception as e:
+        logger.error(f"Failed to update incident {incident_id}: {e}")
+        return {"status": "error", "message": redact(str(e))}
+
+
+@mcp.tool(annotations=READ_ONLY)
+async def get_incident_stats(
+    adom: str | None = None,
+    time_range: str = "30-day",
+    stats_items: list[str] | None = None,
+) -> dict[str, Any]:
+    """Get incident statistics.
+
+    Retrieves aggregated statistics for SOC dashboards
+    including counts by severity, status, and trends.
+
+    Args:
+        adom: ADOM name (default: from config DEFAULT_ADOM)
+        time_range: Time range for statistics (default: "30-day")
+        stats_items: List of stats to retrieve. Options:
+            - "total": Total incident count
+            - "severity": Counts by severity (high/medium/low)
+            - "category": Counts by category
+            - "status": Counts by status
+            - "outbreak": Outbreak incidents
+            Default: ["total", "severity", "status"]
+
+    Returns:
+        dict with incident statistics
+
+    Example:
+        >>> result = await get_incident_stats(time_range="7-day")
+        >>> print(f"High severity: {result['data']['severity']['high']}")
+    """
+    try:
+        adom = validate_adom(adom or get_default_adom())
+        client = _get_client()
+        tr = await _parse_time_range(time_range)
+
+        logger.info(f"Getting incident stats from ADOM {adom}")
+
+        result = await client.get_incident_stats(
+            adom=adom,
+            time_range=tr,
+            stats_items=stats_items,
+        )
+
+        return {
+            "status": "success",
+            "adom": adom,
+            "time_range": tr,
+            "data": result,
+        }
+    except Exception as e:
+        logger.error(f"Failed to get incident stats: {e}")
+        return {"status": "error", "message": redact(str(e))}

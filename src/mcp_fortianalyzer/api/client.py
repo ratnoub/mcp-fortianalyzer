@@ -1,0 +1,2262 @@
+"""FortiAnalyzer API client wrapper using pyfmg library.
+
+Based on FNDN FortiAnalyzer 7.6.5 API specifications.
+"""
+
+import asyncio
+import json
+import logging
+from collections.abc import Awaitable, Callable
+from pathlib import Path
+from typing import Any, cast
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+from pyFMG.fortimgr import FortiManager
+
+from mcp_fortianalyzer.utils.config import Settings
+from mcp_fortianalyzer.utils.errors import (
+    APIError,
+    AuthenticationError,
+    ConnectionError,
+    parse_faz_error,
+)
+from mcp_fortianalyzer.utils.validation import sanitize_json_for_logging
+
+logger = logging.getLogger(__name__)
+
+# API Version for FortiAnalyzer 7.6.4
+API_VERSION = 3
+
+
+class FortiAnalyzerClient:
+    """Client for FortiAnalyzer JSON RPC API using pyfmg library.
+
+    This client wraps the pyfmg FortiManager class which supports both
+    FortiManager and FortiAnalyzer appliances via the same JSON-RPC API.
+
+    Based on FNDN FortiAnalyzer 7.6.4 specifications.
+    """
+
+    # Resilience: bounded transient retry with exponential backoff. Reconnect
+    # is handled separately by ensure_connected() (tools call it upfront).
+    _TRANSIENT_RETRIES = 2
+    _TRANSIENT_BACKOFF_BASE = 0.5  # seconds; doubled each retry
+    # FAZ error codes worth a retry on the same session: internal/general error.
+    _TRANSIENT_ERROR_CODES = frozenset({-1})
+    # FAZ error codes that mean the server session is gone (revive once).
+    # -11 "No permission for the resource" is what an expired or closed FAZ
+    # session returns on a per-request basis (not a clean no-session error), so a
+    # long-lived client must re-login on it instead of retrying the dead session.
+    _RECONNECTABLE_ERROR_CODES = frozenset({-2, -11, -20, -21})
+
+    def __init__(
+        self,
+        host: str,
+        api_token: str | None = None,
+        username: str | None = None,
+        password: str | None = None,
+        verify_ssl: bool = True,
+        ca_bundle: str | None = None,
+        timeout: int = 30,
+        max_retries: int = 3,
+    ) -> None:
+        """Initialize FortiAnalyzer client."""
+        self.host = host.replace("https://", "").replace("http://", "").rstrip("/")
+        self.api_token = api_token
+        self.username = username
+        self.password = password
+        self.verify_ssl = verify_ssl
+        # Refuse at construction. Passing a bad path through would fail at the
+        # first call, and a typo'd one must never fall back to the system trust
+        # store: that verifies against the wrong root and looks like success.
+        if ca_bundle and not Path(ca_bundle).is_file():
+            raise ValueError(
+                f"CA bundle not found: {ca_bundle!r}. FORTIANALYZER_CA_BUNDLE must "
+                "point at a readable PEM file."
+            )
+        self.ca_bundle = ca_bundle
+        self.timeout = timeout
+        self.max_retries = max_retries
+
+        self._fmg: FortiManager | None = None
+        self._connected = False
+        # True once a login has succeeded at least once. Distinguishes a session
+        # that dropped after being connected (revive it) from a client that was
+        # never connected (a direct API call should still raise "Not connected").
+        self._ever_connected = False
+        self._faz_version: tuple[int, int, int] | None = None  # (major, minor, patch)
+        self._faz_tz: ZoneInfo | None = None  # cached FAZ system timezone
+        self._faz_tz_detected = False  # True once TZ detection ran to a definitive answer
+        # Serialize forced reconnects so concurrent requests that all hit a
+        # dropped session perform a single re-login instead of racing to clear
+        # and rebuild ``_fmg`` underneath one another. The generation counter
+        # lets a waiter detect that a peer already reconnected while it blocked.
+        self._reconnect_lock = asyncio.Lock()
+        self._reconnect_generation = 0
+        # Serialize all blocking pyfmg I/O. pyfmg shares one requests.Session
+        # and req_id counter, neither safe under concurrent use from worker
+        # threads. One in-flight FAZ request at a time matches the previous
+        # (loop-blocking) behavior while keeping the event loop responsive.
+        self._io_lock = asyncio.Lock()
+
+        logger.info(f"Initialized FortiAnalyzer client for {self.host}")
+
+    @classmethod
+    def from_settings(cls, settings: Settings) -> "FortiAnalyzerClient":
+        """Create client from settings."""
+        return cls(
+            host=settings.FORTIANALYZER_HOST,
+            api_token=settings.FORTIANALYZER_API_TOKEN,
+            username=settings.FORTIANALYZER_USERNAME,
+            password=settings.FORTIANALYZER_PASSWORD,
+            verify_ssl=settings.FORTIANALYZER_VERIFY_SSL,
+            ca_bundle=settings.FORTIANALYZER_CA_BUNDLE or None,
+            timeout=settings.FORTIANALYZER_TIMEOUT,
+            max_retries=settings.FORTIANALYZER_MAX_RETRIES,
+        )
+
+    def resolve_verify(self) -> bool | str:
+        """What to hand ``requests`` as ``verify=``.
+
+        ``requests`` takes a bool or a CA-bundle path and pyfmg forwards the
+        value unchanged, so a path needs no pyfmg change. Disabled
+        verification wins over a configured bundle, so an explicit
+        ``FORTIANALYZER_VERIFY_SSL=false`` is never silently upgraded.
+        """
+        if not self.verify_ssl:
+            return False
+        return self.ca_bundle or True
+
+    async def connect(self) -> None:
+        """Establish connection and authenticate."""
+        if self._connected:
+            logger.warning("Client already connected")
+            return
+
+        logger.info("Connecting to FortiAnalyzer")
+        if not self.verify_ssl:
+            # This used to end "prefer trusting the FAZ CA (set the CA bundle)".
+            # It named a setting that did not exist, and the remedy would not
+            # have been enough anyway: a factory FortiAnalyzer certificate is
+            # self-signed with the serial as CN and carries no subjectAltName,
+            # so even with it trusted as the CA bundle a request by IP fails
+            # CERTIFICATE_VERIFY_FAILED on an address mismatch (#126).
+            logger.warning(
+                "TLS verification is DISABLED (FORTIANALYZER_VERIFY_SSL=false) -- the FortiAnalyzer "
+                "API token and all log/PCAP data are exposed to man-in-the-middle interception. "
+                "Trusting the appliance CA is NOT sufficient on its own: a factory certificate is "
+                "self-signed with the serial as CN and carries no subjectAltName, so verification "
+                "still fails on an address mismatch. To enable it, install a certificate on the "
+                "appliance naming the address you connect to, then set FORTIANALYZER_CA_BUNDLE to "
+                "its issuing CA and FORTIANALYZER_VERIFY_SSL=true."
+            )
+        elif self.ca_bundle:
+            logger.info(
+                "TLS verification enabled for %s against CA bundle %s", self.host, self.ca_bundle
+            )
+
+        # Hold the I/O lock across the connected-check and login so two
+        # concurrent connect() calls (now possible since login runs off-loop)
+        # cannot both log in and leak a session.
+        async with self._io_lock:
+            if self._connected:
+                return
+            try:
+                if self.api_token:
+                    self._fmg = FortiManager(
+                        self.host,
+                        apikey=self.api_token,
+                        debug=False,
+                        use_ssl=True,
+                        verify_ssl=self.resolve_verify(),
+                        timeout=self.timeout,
+                        check_adom_workspace=False,
+                    )
+                elif self.username and self.password:
+                    self._fmg = FortiManager(
+                        self.host,
+                        self.username,
+                        self.password,
+                        debug=False,
+                        use_ssl=True,
+                        verify_ssl=self.resolve_verify(),
+                        timeout=self.timeout,
+                    )
+                else:
+                    raise AuthenticationError(
+                        "No authentication provided. Set API token or username/password."
+                    )
+
+                code, response = await asyncio.to_thread(self._fmg.login)
+
+                if code != 0:
+                    error_msg = response.get("status", {}).get("message", "Login failed")
+                    raise AuthenticationError(f"FortiAnalyzer login failed: {error_msg}")
+
+                self._connected = True
+                self._ever_connected = True
+                logger.info("Successfully connected to FortiAnalyzer")
+
+            except AuthenticationError:
+                # Drop the half-built pyfmg instance so repeated failed
+                # connects don't each orphan a requests.Session pool.
+                self._fmg = None
+                raise
+            except Exception as e:
+                self._fmg = None
+                logger.error(f"Connection failed: {e}")
+                raise ConnectionError(f"Failed to connect to FortiAnalyzer: {e}") from e
+
+    async def disconnect(self) -> None:
+        """Disconnect and cleanup resources."""
+        if not self._connected or not self._fmg:
+            return
+
+        logger.info("Disconnecting from FortiAnalyzer")
+
+        try:
+            async with self._io_lock:
+                await asyncio.to_thread(self._fmg.logout)
+        except Exception as e:
+            logger.warning(f"Logout failed: {e}")
+        finally:
+            self._fmg = None
+            self._connected = False
+            logger.info("Disconnected from FortiAnalyzer")
+
+    async def __aenter__(self) -> "FortiAnalyzerClient":
+        """Async context manager entry."""
+        await self.connect()
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        """Async context manager exit."""
+        await self.disconnect()
+
+    @property
+    def is_connected(self) -> bool:
+        """Check if client is connected."""
+        return self._connected and self._fmg is not None
+
+    @property
+    def faz_version(self) -> tuple[int, int, int] | None:
+        """Get cached FortiAnalyzer version tuple (major, minor, patch)."""
+        return self._faz_version
+
+    async def _detect_version(self) -> tuple[int, int, int]:
+        """Detect and cache FortiAnalyzer version.
+
+        Returns tuple of (major, minor, patch).
+        """
+        if self._faz_version is not None:
+            return self._faz_version
+
+        try:
+            status = await self.get_system_status()
+            version_str = status.get("Version", "7.0.0")
+            # Version format: "v7.6.5-build3653 251215 (GA.M)"
+            version_part = version_str.split("-")[0].split()[0]
+            # Strip leading 'v' if present
+            version_part = version_part.lstrip("v")
+            parts = version_part.split(".")
+            self._faz_version = (
+                int(parts[0]) if len(parts) > 0 else 7,
+                int(parts[1]) if len(parts) > 1 else 0,
+                int(parts[2]) if len(parts) > 2 else 0,
+            )
+            logger.info(f"Detected FortiAnalyzer version: {self._faz_version}")
+        except Exception as e:
+            logger.warning(f"Failed to detect FAZ version, assuming 7.0.0: {e}")
+            self._faz_version = (7, 0, 0)
+
+        return self._faz_version
+
+    async def get_system_timezone(self) -> ZoneInfo | None:
+        """Detect and cache the FAZ system timezone as a ZoneInfo.
+
+        FAZ accepts naive ``YYYY-MM-DD HH:MM:SS`` timestamps and
+        interprets them in its own system TZ. When the MCP host is in
+        a different TZ than FAZ, relative time-range queries silently
+        miss real logs. Callers compute "now" in this TZ before
+        formatting so the bytes-on-wire always match FAZ's clock.
+
+        Falls back to ``None`` if FAZ doesn't report a parseable TZ
+        (older versions or unrecognized IANA names). In that case
+        callers degrade to naive ``datetime.now()`` (legacy behavior).
+
+        Returns:
+            ``ZoneInfo`` for the FAZ system TZ, or ``None`` if it
+            couldn't be determined.
+        """
+        if self._faz_tz_detected:
+            return self._faz_tz
+
+        try:
+            status = await self.get_system_status()
+            # /sys/status reports the IANA name under "TZ" on some builds and
+            # "Time Zone" on others; accept either.
+            tz_name = status.get("TZ") or status.get("Time Zone")
+            if isinstance(tz_name, str) and tz_name:
+                self._faz_tz = ZoneInfo(tz_name)
+                self._faz_tz_detected = True
+                logger.info(f"Detected FAZ system timezone: {tz_name}")
+                return self._faz_tz
+            logger.warning(
+                "FAZ system status missing TZ/Time Zone field; time-range queries may misalign."
+            )
+            # Cache the negative outcome: without this, every relative-range
+            # query re-probes /sys/status for the life of the process.
+            self._faz_tz_detected = True
+        except ZoneInfoNotFoundError as e:
+            logger.warning(f"FAZ reported unknown IANA timezone {e}; falling back to naive")
+            self._faz_tz_detected = True
+        except Exception as e:
+            # Probe itself failed (network/session); do NOT cache, so a later
+            # call can still detect the TZ once FAZ is reachable again.
+            logger.warning(f"Failed to detect FAZ timezone: {e}; falling back to naive")
+        return None
+
+    def _ensure_connected(self) -> FortiManager:
+        """Ensure client is connected and return pyfmg instance."""
+        if not self._connected or not self._fmg:
+            raise ConnectionError("Not connected. Call connect() first.")
+        return self._fmg
+
+    async def ensure_connected(self) -> None:
+        """Reconnect once if the session has dropped.
+
+        Tools call this before issuing requests so an idle-closed session is
+        transparently revived. FortiAnalyzer can report not-connected after a
+        streamable HTTP session closes; a fresh request should reconnect rather
+        than surface a raw "Not connected" error. Raises ConnectionError if the
+        single reconnect attempt fails.
+        """
+        if self.is_connected:
+            return
+        logger.warning("FortiAnalyzer session not connected; reconnecting once")
+        await self.connect()
+
+    def _is_transient_error(self, exc: Exception) -> bool:
+        """Classify whether an error is worth a bounded retry.
+
+        Network errors and a small set of FAZ task errors (internal error,
+        task timeout) are transient. Validation, permission, not-found, and
+        invalid-tid errors are not retried — invalid-tid in particular is owned
+        by the log tools (which re-run the search), so retrying it here would
+        only waste backoff before the tool re-issues.
+        """
+        msg = str(exc).lower()
+        if "tid" in msg and "invalid" in msg:
+            return False
+        if isinstance(exc, OSError):
+            return True
+        code = getattr(exc, "code", None)
+        return code in self._TRANSIENT_ERROR_CODES
+
+    def _is_session_error(self, exc: Exception) -> bool:
+        """Classify whether an error means the server session is gone.
+
+        A stale/expired session (e.g. the appliance closed an idle session)
+        surfaces as an auth error while the local client still believes it is
+        connected. A raw ``ConnectionError("Not connected. ...")`` from
+        :meth:`_ensure_connected` means the local client lost its session
+        mid-request (e.g. another path disconnected it). Both are recoverable by
+        re-logging in once. Invalid-tid errors are deliberately excluded (the
+        not-connected message carries no ``tid``) — those are owned by the log
+        tools, which re-issue the search.
+        """
+        if isinstance(exc, AuthenticationError):
+            return True
+        # A local not-connected error means the session dropped mid-request --
+        # but only revive it if we were genuinely connected before. A client that
+        # never connected must still surface "Not connected" rather than silently
+        # attempting a first login on an arbitrary API call.
+        if (
+            self._ever_connected
+            and isinstance(exc, ConnectionError)
+            and "not connected" in str(exc).lower()
+        ):
+            return True
+        return getattr(exc, "code", None) in self._RECONNECTABLE_ERROR_CODES
+
+    async def _force_reconnect(self) -> None:
+        """Drop stale connection state and reconnect (re-login), serialized.
+
+        The lock ensures that when several concurrent requests all hit a dropped
+        session, only the first re-logs in; the others observe the bumped
+        generation and return without tearing the revived connection back down.
+        (A stale session still reports ``is_connected`` locally, so the
+        generation counter -- not ``is_connected`` -- is what detects a peer's
+        reconnect.)
+        """
+        observed = self._reconnect_generation
+        async with self._reconnect_lock:
+            if self._reconnect_generation != observed:
+                # A concurrent caller already reconnected while we waited.
+                return
+            self._connected = False
+            self._fmg = None
+            await self.connect()
+            self._reconnect_generation += 1
+
+    async def _execute_resilient(
+        self,
+        factory: Callable[[], Awaitable[Any]],
+        *,
+        sleep: Callable[[float], Awaitable[None]] | None = None,
+        idempotent: bool = True,
+    ) -> Any:
+        """Run an async request factory with reconnect-once + transient retry.
+
+        A stale-session error triggers exactly one forced reconnect (re-login)
+        and a retry — this revives a session the appliance dropped while the
+        local client still believed it was connected. Transient FAZ/network
+        errors are then retried up to ``_TRANSIENT_RETRIES`` with exponential
+        backoff. Validation, invalid-tid, and not-connected errors are surfaced
+        immediately so callers can handle them.
+
+        ``idempotent=False`` disables the transient retry (network error / FAZ
+        code -1): those errors can fire after the request already executed
+        server-side, so replaying an ADD/SET/EXEC would double-execute it
+        (e.g. create a duplicate incident). The session-error reconnect stays
+        enabled either way — an expired session means the request was never
+        accepted, so replaying it is safe.
+        """
+        sleeper = sleep or asyncio.sleep
+        retries_left = self._TRANSIENT_RETRIES if idempotent else 0
+        reconnect_left = 1
+        attempt = 0
+        while True:
+            try:
+                return await factory()
+            except Exception as exc:
+                if reconnect_left > 0 and self._is_session_error(exc):
+                    reconnect_left -= 1
+                    logger.warning("FortiAnalyzer session invalid; reconnecting once and retrying")
+                    await self._force_reconnect()
+                    continue
+                if retries_left <= 0 or not self._is_transient_error(exc):
+                    # Record transient retries performed so tools can surface
+                    # retry_count. Paths that bypass this raise (force-reconnect
+                    # failure, ensure_connected, invalid-tid reissue) carry no
+                    # attribute and read back as 0 via getattr.
+                    exc.retries_attempted = attempt  # type: ignore[attr-defined]
+                    raise
+                retries_left -= 1
+                delay = self._TRANSIENT_BACKOFF_BASE * (2**attempt)
+                attempt += 1
+                logger.warning(f"Transient FortiAnalyzer error; retrying in {delay:.1f}s: {exc}")
+                await sleeper(delay)
+
+    def _handle_response(self, code: int, response: Any, operation: str = "operation") -> Any:
+        """Handle pyfmg response and raise appropriate exceptions."""
+        if code == 0:
+            return response
+
+        if isinstance(response, dict):
+            error_msg = response.get("status", {}).get("message", str(response))
+        else:
+            error_msg = str(response)
+
+        raise parse_faz_error(code, error_msg, operation)
+
+    # =========================================================================
+    # Raw Request for LogView APIs
+    # =========================================================================
+
+    async def _raw_request(self, method: str, url: str, **kwargs: Any) -> Any:
+        """Execute a raw LogView JSON-RPC request with transient-retry resilience."""
+
+        async def _factory() -> Any:
+            return await self._raw_request_once(method, url, **kwargs)
+
+        return await self._execute_resilient(_factory, idempotent=method.lower() == "get")
+
+    async def _raw_request_once(self, method: str, url: str, **kwargs: Any) -> Any:
+        """Execute raw JSON-RPC request for APIs with non-standard response format.
+
+        LogView API returns responses in format: {"result": {"data": [...]}}
+        instead of the standard: {"result": [{"status": {...}, "data": [...]}]}
+
+        This method handles the LogView response format directly.
+        """
+        fmg = self._ensure_connected()
+
+        # Build request payload
+        params = [{"url": url}]
+        params[0].update(kwargs)
+
+        json_request = {
+            "method": method,
+            "params": params,
+            "id": fmg.req_id + 1,
+            "jsonrpc": "2.0",
+        }
+        # Only include session for username/password auth.
+        # For API key auth, the Bearer header is used instead.
+        # Including pyfmg's fake session ID causes FAZ to reject the request.
+        if not fmg.api_key_used:
+            json_request["session"] = fmg.sid
+
+        # Debug logging - show what we're sending (with sensitive data masked)
+        logger.debug(f"API Request: {method.upper()} {url}")
+        logger.debug(f"Request params: {sanitize_json_for_logging(params, indent=2)}")
+
+        # Set headers based on auth type
+        if fmg.api_key_used:
+            headers = {
+                "content-type": "application/json",
+                "Authorization": f"Bearer {fmg._passwd}",
+            }
+        else:
+            headers = {"content-type": "application/json"}
+
+        # Make request off the event loop; serialized via the I/O lock so the
+        # shared requests.Session is never used from two threads at once.
+        async with self._io_lock:
+            response = await asyncio.to_thread(
+                fmg.sess.post,
+                fmg._url,
+                data=json.dumps(json_request),
+                verify=self.resolve_verify(),
+                timeout=fmg.timeout,
+                headers=headers,
+            )
+
+        try:
+            result = response.json()
+        except json.JSONDecodeError as e:
+            logger.error(f"Invalid JSON response: {response.text[:500]}")
+            raise APIError(f"Invalid JSON response: {e}") from e
+
+        # Debug logging - show what we received (with sensitive data masked)
+        logger.debug(f"API Response: {sanitize_json_for_logging(result, indent=2)[:2000]}")
+
+        # Check for JSON-RPC error response first
+        if "error" in result:
+            error = result["error"]
+            code = error.get("code", -1)
+            msg = error.get("message", "Unknown error")
+            raise parse_faz_error(code, msg, f"{method.upper()} {url}")
+
+        # Handle response format - some APIs return empty responses (no result field)
+        # e.g., get_running_reports when no reports are running returns: {'jsonrpc': '2.0', 'id': 2}
+        if "result" not in result:
+            # Empty response - return empty dict with data: [] for consistency
+            logger.debug("Response has no 'result' field - returning empty data")
+            return {"data": []}
+
+        res = result["result"]
+
+        # Handle both formats: {"result": {"data": ...}} and {"result": [{"status": ..., "data": ...}]}
+        if isinstance(res, list) and len(res) > 0:
+            item = res[0]
+            if isinstance(item, dict) and "status" in item:
+                status = item["status"]
+                # Some endpoints return "status" as a plain string ("ok") the
+                # same way the dict-form branch below tolerates; only a dict
+                # status can carry an error code.
+                if isinstance(status, dict):
+                    code = status.get("code", 0)
+                    if code != 0:
+                        msg = status.get("message", "Unknown error")
+                        raise parse_faz_error(code, msg, f"{method.upper()} {url}")
+                return item.get("data", item)
+            return item
+        elif isinstance(res, dict):
+            # Check for error status first
+            # Handle both formats: {"status": {"code": 0, "message": "ok"}} and {"status": "ok"}
+            if "status" in res:
+                status = res["status"]
+                if isinstance(status, dict):
+                    code = status.get("code", 0)
+                    if code != 0:
+                        msg = status.get("message", "Unknown error")
+                        raise parse_faz_error(code, msg, f"{method.upper()} {url}")
+                # If status is a string like "ok", it's a success indicator
+
+            # LogView format: return the full result dict to preserve metadata
+            # This includes: percentage, return-lines, total-count, data, status, tid, etc.
+            return res
+
+        # Empty result list - return empty data
+        return {"data": []}
+
+    # =========================================================================
+    # Generic Operations
+    # =========================================================================
+
+    async def _generic_request(self, verb: str, url: str, **kwargs: Any) -> Any:
+        """Run a standard pyfmg verb with bounded transient-retry resilience."""
+
+        async def _factory() -> Any:
+            fmg = self._ensure_connected()
+            method = getattr(fmg, verb)
+            # Run the blocking pyfmg verb off the event loop; serialized via
+            # the I/O lock (shared requests.Session is not thread-safe).
+            async with self._io_lock:
+                code, response = await asyncio.to_thread(lambda: method(url, **kwargs))
+            return self._handle_response(code, response, f"{verb.upper()} {url}")
+
+        return await self._execute_resilient(_factory, idempotent=verb.lower() == "get")
+
+    async def get(self, url: str, **kwargs: Any) -> Any:
+        """Execute GET request."""
+        return await self._generic_request("get", url, **kwargs)
+
+    async def add(self, url: str, **kwargs: Any) -> Any:
+        """Execute ADD request."""
+        return await self._generic_request("add", url, **kwargs)
+
+    async def set(self, url: str, **kwargs: Any) -> Any:
+        """Execute SET request."""
+        return await self._generic_request("set", url, **kwargs)
+
+    async def update(self, url: str, **kwargs: Any) -> Any:
+        """Execute UPDATE request."""
+        return await self._generic_request("update", url, **kwargs)
+
+    async def delete(self, url: str, **kwargs: Any) -> Any:
+        """Execute DELETE request."""
+        return await self._generic_request("delete", url, **kwargs)
+
+    async def execute(self, url: str, **kwargs: Any) -> Any:
+        """Execute EXEC request."""
+        return await self._generic_request("execute", url, **kwargs)
+
+    async def _request_dict(self, verb: str, url: str, **kwargs: Any) -> dict[str, Any]:
+        """Typed _generic_request for endpoints whose payload is a JSON object.
+
+        The JSON-RPC layer is untyped (payload shape varies by endpoint);
+        this is the single cast point for object-shaped responses.
+        """
+        return cast(dict[str, Any], await self._generic_request(verb, url, **kwargs))
+
+    async def _raw_request_dict(self, method: str, url: str, **kwargs: Any) -> dict[str, Any]:
+        """Typed _raw_request counterpart for object-shaped LogView responses."""
+        return cast(dict[str, Any], await self._raw_request(method, url, **kwargs))
+
+    # =========================================================================
+    # DVMDB - Device Manager Database (from dvmdb.json)
+    # =========================================================================
+
+    async def list_adoms(
+        self,
+        fields: list[str] | None = None,
+        filter: list[Any] | None = None,
+        loadsub: int = 0,
+    ) -> list[dict[str, Any]]:
+        """List all ADOMs.
+
+        FNDN: GET /dvmdb/adom
+        """
+        params: dict[str, Any] = {"loadsub": loadsub}
+        if fields:
+            params["fields"] = fields
+        if filter:
+            params["filter"] = filter
+
+        result = await self.get("/dvmdb/adom", **params)
+        return result if isinstance(result, list) else [result] if result else []
+
+    async def get_adom(self, name: str, loadsub: int = 0) -> dict[str, Any]:
+        """Get specific ADOM.
+
+        FNDN: GET /dvmdb/adom/{adom}
+        """
+        return await self._request_dict("get", f"/dvmdb/adom/{name}", loadsub=loadsub)
+
+    async def list_devices(
+        self,
+        adom: str = "root",
+        fields: list[str] | None = None,
+        filter: list[Any] | None = None,
+        loadsub: int = 0,
+    ) -> list[dict[str, Any]]:
+        """List devices in ADOM.
+
+        FNDN: GET /dvmdb/adom/{adom}/device
+        """
+        params: dict[str, Any] = {"loadsub": loadsub}
+        if fields:
+            params["fields"] = fields
+        if filter:
+            params["filter"] = filter
+
+        result = await self.get(f"/dvmdb/adom/{adom}/device", **params)
+        return result if isinstance(result, list) else [result] if result else []
+
+    async def get_device(self, device: str, adom: str = "root", loadsub: int = 0) -> dict[str, Any]:
+        """Get specific device.
+
+        FNDN: GET /dvmdb/adom/{adom}/device/{device}
+        """
+        return await self._request_dict(
+            "get", f"/dvmdb/adom/{adom}/device/{device}", loadsub=loadsub
+        )
+
+    async def list_device_vdoms(self, device: str, adom: str = "root") -> list[dict[str, Any]]:
+        """List VDOMs for a device.
+
+        FNDN: GET /dvmdb/adom/{adom}/device/{device}/vdom
+        """
+        result = await self.get(f"/dvmdb/adom/{adom}/device/{device}/vdom")
+        return result if isinstance(result, list) else [result] if result else []
+
+    async def list_device_groups(self, adom: str = "root") -> list[dict[str, Any]]:
+        """List device groups.
+
+        FNDN: GET /dvmdb/adom/{adom}/group
+        """
+        result = await self.get(f"/dvmdb/adom/{adom}/group")
+        return result if isinstance(result, list) else [result] if result else []
+
+    # =========================================================================
+    # DVM - Device Manager Commands (from dvm.json)
+    # =========================================================================
+
+    async def add_device(
+        self,
+        adom: str,
+        device: dict[str, Any],
+        flags: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Add a device to FortiAnalyzer.
+
+        FNDN: EXEC /dvm/cmd/add/device
+
+        Args:
+            adom: ADOM name
+            device: Device configuration dict with:
+                - name: Device name (required)
+                - ip: Device IP (for real device)
+                - adm_usr: Admin username
+                - adm_pass: Admin password
+                - sn: Serial number (for model device)
+                - mgmt_mode: Management mode (faz, fmg, fmgfaz)
+        """
+        data: dict[str, Any] = {"adom": adom, "device": device}
+        if flags:
+            data["flags"] = flags
+
+        return await self._request_dict("execute", "/dvm/cmd/add/device", **data)
+
+    async def delete_device(
+        self,
+        adom: str,
+        device: str,
+        flags: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Delete a device from FortiAnalyzer.
+
+        FNDN: EXEC /dvm/cmd/del/device
+        """
+        data: dict[str, Any] = {"adom": adom, "device": device}
+        if flags:
+            data["flags"] = flags
+
+        return await self._request_dict("execute", "/dvm/cmd/del/device", **data)
+
+    async def add_device_list(
+        self,
+        adom: str,
+        devices: list[dict[str, Any]],
+        flags: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Add multiple devices.
+
+        FNDN: EXEC /dvm/cmd/add/dev-list
+        """
+        data: dict[str, Any] = {"adom": adom, "add-dev-list": devices}
+        if flags:
+            data["flags"] = flags
+
+        return await self._request_dict("execute", "/dvm/cmd/add/dev-list", **data)
+
+    async def delete_device_list(
+        self,
+        adom: str,
+        devices: list[dict[str, Any]],
+        flags: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Delete multiple devices.
+
+        FNDN: EXEC /dvm/cmd/del/dev-list
+        """
+        data: dict[str, Any] = {"adom": adom, "del-dev-member-list": devices}
+        if flags:
+            data["flags"] = flags
+
+        return await self._request_dict("execute", "/dvm/cmd/del/dev-list", **data)
+
+    # =========================================================================
+    # LogView - Log Search Operations (from logview.json)
+    # =========================================================================
+
+    async def logsearch_start(
+        self,
+        adom: str,
+        logtype: str,
+        device: list[dict[str, str]],
+        time_range: dict[str, str],
+        filter: str | None = None,
+        case_sensitive: bool = False,
+        time_order: str = "desc",
+        limit: int = 100,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        """Start a log search task.
+
+        FNDN: ADD /logview/adom/{adom}/logsearch
+
+        This is a two-step operation:
+        1. Start search (returns TID)
+        2. Fetch results using TID
+
+        Args:
+            adom: ADOM name
+            logtype: Log type (traffic, event, attack, virus, webfilter, etc.)
+            device: Device filter list [{"devname": "myfw01"}, ...]
+            time_range: {"start": "2024-01-01 00:00:00", "end": "2024-01-02 00:00:00"}
+            filter: Filter expression (e.g., "srcip==10.0.0.1")
+            case_sensitive: Case sensitivity for filter
+            time_order: Sort order ("asc" or "desc")
+            limit: Max records (1-1000)
+            offset: Record offset
+
+        Returns:
+            {"tid": 12345} - Task ID for fetching results
+        """
+        data: dict[str, Any] = {
+            "apiver": API_VERSION,
+            "device": device,
+            "logtype": logtype,
+            "time-range": time_range,
+            "time-order": time_order,
+            "limit": limit,
+            "offset": offset,
+            "case-sensitive": case_sensitive,
+        }
+        if filter:
+            data["filter"] = filter
+
+        return await self._raw_request_dict("add", f"/logview/adom/{adom}/logsearch", **data)
+
+    async def logsearch_fetch(
+        self,
+        adom: str,
+        tid: int,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        """Fetch log search results by task ID.
+
+        FNDN: GET /logview/adom/{adom}/logsearch/{tid}
+
+        Args:
+            adom: ADOM name
+            tid: Task ID from logsearch_start
+            limit: Max records per fetch (1-500)
+            offset: Record offset
+
+        Returns:
+            {
+                "percentage": 100,
+                "return-lines": 50,
+                "data": [...],
+                "status": {"code": 0, "message": "..."}
+            }
+        """
+        return await self._raw_request_dict(
+            "get",
+            f"/logview/adom/{adom}/logsearch/{tid}",
+            apiver=API_VERSION,
+            limit=limit,
+            offset=offset,
+        )
+
+    async def logsearch_cancel(self, adom: str, tid: int) -> dict[str, Any]:
+        """Cancel a log search task.
+
+        FNDN: DELETE /logview/adom/{adom}/logsearch/{tid}
+        """
+        return await self._raw_request_dict(
+            "delete",
+            f"/logview/adom/{adom}/logsearch/{tid}",
+            apiver=API_VERSION,
+        )
+
+    async def get_logfields(
+        self,
+        adom: str,
+        logtype: str,
+        devtype: str = "FortiGate",
+    ) -> dict[str, Any]:
+        """Get available log fields for a log type.
+
+        FNDN: GET /logview/adom/{adom}/logfields
+        """
+        return await self._raw_request_dict(
+            "get",
+            f"/logview/adom/{adom}/logfields",
+            apiver=API_VERSION,
+            logtype=logtype,
+            devtype=devtype,
+        )
+
+    async def get_logstats(
+        self,
+        adom: str,
+        device: list[dict[str, str]] | None = None,
+    ) -> dict[str, Any]:
+        """Get log statistics.
+
+        FNDN: GET /logview/adom/{adom}/logstats
+
+        Returns device logging stats including:
+        - Last log time
+        - Log rate
+        - Disk usage
+        """
+        params: dict[str, Any] = {"apiver": API_VERSION}
+        if device:
+            params["device"] = device
+
+        return await self._raw_request_dict("get", f"/logview/adom/{adom}/logstats", **params)
+
+    async def get_logfiles_state(
+        self,
+        adom: str,
+        devid: str | None = None,
+        vdom: str | None = None,
+        time_range: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """Get log file state.
+
+        FNDN: GET /logview/adom/{adom}/logfiles/state
+        """
+        params: dict[str, Any] = {"apiver": API_VERSION}
+        if devid:
+            params["devid"] = devid
+        if vdom:
+            params["vdom"] = vdom
+        if time_range:
+            params["time-range"] = time_range
+
+        return await self._raw_request_dict("get", f"/logview/adom/{adom}/logfiles/state", **params)
+
+    async def get_logfiles_data(
+        self,
+        adom: str,
+        devid: str,
+        vdom: str,
+        filename: str,
+        data_type: str = "base64",
+        offset: int = 0,
+        length: int = 1048576,
+    ) -> dict[str, Any]:
+        """Get log file content.
+
+        FNDN: GET /logview/adom/{adom}/logfiles/data
+
+        Args:
+            data_type: "base64", "csv/gzip/base64", "text/gzip/base64"
+            length: Max 50MB (52428800)
+        """
+        return await self._raw_request_dict(
+            "get",
+            f"/logview/adom/{adom}/logfiles/data",
+            apiver=API_VERSION,
+            devid=devid,
+            vdom=vdom,
+            filename=filename,
+            **{"data-type": data_type},
+            offset=offset,
+            length=length,
+        )
+
+    async def search_logfiles(
+        self,
+        adom: str,
+        devid: str,
+        vdom: str,
+        filename: str,
+        logtype: str,
+        filter: str | None = None,
+        case_sensitive: bool = True,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        """Search within a specific log file.
+
+        FNDN: GET /logview/adom/{adom}/logfiles/search
+        """
+        params: dict[str, Any] = {
+            "apiver": API_VERSION,
+            "devid": devid,
+            "vdom": vdom,
+            "filename": filename,
+            "logtype": logtype,
+            "case-sensitive": case_sensitive,
+            "limit": limit,
+            "offset": offset,
+        }
+        if filter:
+            params["filter"] = filter
+
+        return await self._raw_request_dict(
+            "get", f"/logview/adom/{adom}/logfiles/search", **params
+        )
+
+    async def get_pcapfile(
+        self,
+        key_data: str,
+        key_type: str = "log-data",
+    ) -> dict[str, Any]:
+        """Get PCAP file associated with a log.
+
+        FNDN: GET /logview/pcapfile
+
+        Args:
+            key_data: Log data (JSON or pcapurl)
+            key_type: "log-data" or "pcapurl"
+        """
+        return await self._raw_request_dict(
+            "get",
+            "/logview/pcapfile",
+            apiver=API_VERSION,
+            **{"key-data": key_data, "key-type": key_type},
+        )
+
+    # =========================================================================
+    # Task Management (from task.json)
+    # =========================================================================
+
+    async def list_tasks(
+        self,
+        filter: list[Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        """List all tasks.
+
+        FNDN: GET /task/task
+        """
+        params: dict[str, Any] = {}
+        if filter:
+            params["filter"] = filter
+
+        result = await self.get("/task/task", **params)
+        return result if isinstance(result, list) else [result] if result else []
+
+    async def get_task(self, task_id: int) -> dict[str, Any]:
+        """Get task details.
+
+        FNDN: GET /task/task/{task_id}
+        """
+        return await self._request_dict("get", f"/task/task/{task_id}")
+
+    async def get_task_line(self, task_id: int) -> list[dict[str, Any]]:
+        """Get task line details.
+
+        FNDN: GET /task/task/{task_id}/line
+        """
+        result = await self.get(f"/task/task/{task_id}/line")
+        return result if isinstance(result, list) else [result] if result else []
+
+    # =========================================================================
+    # System Status (from sys.json)
+    # =========================================================================
+
+    async def get_system_status(self) -> dict[str, Any]:
+        """Get FortiAnalyzer system status.
+
+        FNDN: GET /sys/status
+        """
+        return await self._request_dict("get", "/sys/status")
+
+    async def get_ha_status(self) -> dict[str, Any]:
+        """Get HA status.
+
+        FNDN: GET /sys/ha/status
+        """
+        return await self._request_dict("get", "/sys/ha/status")
+
+    # =========================================================================
+    # Event Management (from eventmgmt.json)
+    # =========================================================================
+
+    async def get_alerts(
+        self,
+        adom: str,
+        time_range: dict[str, str] | None = None,
+        filter: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+        time_order: str = "desc",
+    ) -> dict[str, Any]:
+        """Get alert events.
+
+        FNDN: GET /eventmgmt/adom/{adom}/alerts
+
+        ``time-order`` is not among this endpoint's documented parameters on
+        7.6.6 or 8.0.0 (``/alertlogs`` does define one). It is still sent:
+        the spec demonstrably under-reports this API — logtypes 20-28 are
+        absent from it and live on the appliance — and dropping it would
+        risk flipping alert ordering away from newest-first on nothing
+        firmer than an omission. Do not treat it as load-bearing.
+
+        Args:
+            adom: ADOM name
+            time_range: {"start": "2024-01-01 00:00:00", "end": "2024-01-02 00:00:00"}
+            filter: Filter expression. Supported fields differ from
+                ``get_alerts_count``: here ``event_value``, ``severity``,
+                ``trigger_name``, ``count``, ``comment``, ``flags`` — note
+                ``trigger_name``, which the count endpoint spells
+                ``triggername``.
+            limit: Max records (1-2000)
+            offset: Record offset
+            time_order: Sort order ("asc" or "desc"); see note above
+        """
+        params: dict[str, Any] = {
+            "apiver": API_VERSION,
+            "limit": limit,
+            "offset": offset,
+            "time-order": time_order,
+        }
+        if time_range:
+            params["time-range"] = time_range
+        if filter:
+            params["filter"] = filter
+
+        return await self._raw_request_dict("get", f"/eventmgmt/adom/{adom}/alerts", **params)
+
+    async def get_alerts_count(
+        self,
+        adom: str,
+        time_range: dict[str, str] | None = None,
+        filter: str | None = None,
+    ) -> dict[str, Any]:
+        """Get alert count.
+
+        FNDN: GET /eventmgmt/adom/{adom}/alerts/count
+
+        The filter vocabulary here is NOT the one ``get_alerts`` takes:
+        ``ackflag``, ``assigned``, ``mgmt_state``, ``triggername``,
+        ``eventtype``, ``severity``, ``eventstatus``, ``tag``. Same concept,
+        different spelling — ``triggername`` here, ``trigger_name`` there.
+        ``group-by`` (severity/trigger/severity_timescale/eventtype/
+        mgmt_state/severity_epdevtype) and ``timescale`` are also available
+        and not currently surfaced.
+        """
+        params: dict[str, Any] = {"apiver": API_VERSION}
+        if time_range:
+            params["time-range"] = time_range
+        if filter:
+            params["filter"] = filter
+
+        return await self._raw_request_dict("get", f"/eventmgmt/adom/{adom}/alerts/count", **params)
+
+    async def acknowledge_alerts(
+        self,
+        adom: str,
+        alert_ids: list[str],
+        user: str,
+    ) -> dict[str, Any]:
+        """Acknowledge alert events.
+
+        FNDN: UPDATE /eventmgmt/adom/{adom}/alerts/ack
+        """
+        return await self._raw_request_dict(
+            "update",
+            f"/eventmgmt/adom/{adom}/alerts/ack",
+            apiver=API_VERSION,
+            alertid=alert_ids,
+            **{"update-by": user},
+        )
+
+    async def unacknowledge_alerts(
+        self,
+        adom: str,
+        alert_ids: list[str],
+        user: str,
+    ) -> dict[str, Any]:
+        """Unacknowledge alert events.
+
+        FNDN: UPDATE /eventmgmt/adom/{adom}/alerts/unack
+        """
+        return await self._raw_request_dict(
+            "update",
+            f"/eventmgmt/adom/{adom}/alerts/unack",
+            apiver=API_VERSION,
+            alertid=alert_ids,
+            **{"update-by": user},
+        )
+
+    async def get_alert_logs(
+        self,
+        adom: str,
+        alert_ids: list[str],
+        limit: int = 1000,
+        offset: int = 0,
+        time_order: str = "desc",
+    ) -> dict[str, Any]:
+        """Get alert event logs.
+
+        FNDN: GET /eventmgmt/adom/{adom}/alertlogs
+        """
+        return await self._raw_request_dict(
+            "get",
+            f"/eventmgmt/adom/{adom}/alertlogs",
+            apiver=API_VERSION,
+            alertid=alert_ids,
+            limit=limit,
+            offset=offset,
+            **{"time-order": time_order},
+        )
+
+    async def get_alert_extra_details(
+        self,
+        adom: str,
+        alert_ids: list[str],
+    ) -> dict[str, Any]:
+        """Get alert extra details.
+
+        FNDN: GET /eventmgmt/adom/{adom}/alerts/extra-details
+        """
+        return await self._raw_request_dict(
+            "get",
+            f"/eventmgmt/adom/{adom}/alerts/extra-details",
+            apiver=API_VERSION,
+            # Spec param is "alertids" (plural) — unlike alertlogs' "alertid".
+            alertids=alert_ids,
+        )
+
+    async def add_alert_comment(
+        self,
+        adom: str,
+        alert_id: str,
+        comment: str,
+        user: str,
+    ) -> dict[str, Any]:
+        """Add comment to alert.
+
+        FNDN: UPDATE /eventmgmt/adom/{adom}/alerts/comment
+
+        The verb is ``update``, not ``add`` — the spec heading reads
+        "Add Alert Comment" but the JSON-RPC method it documents is
+        ``update`` on 7.6.6 and 8.0.0 alike. ``alertid`` is an array here,
+        the same as on ack/unack, even though this wrapper comments on one
+        alert at a time.
+        """
+        return await self._raw_request_dict(
+            "update",
+            f"/eventmgmt/adom/{adom}/alerts/comment",
+            apiver=API_VERSION,
+            alertid=[alert_id],
+            comment=comment,
+            **{"update-by": user},
+        )
+
+    async def get_alert_incident_stats(
+        self,
+        adom: str,
+        time_range: dict[str, str],
+        timescale: str = "month",
+    ) -> dict[str, Any]:
+        """Get alert-incident statistics.
+
+        FNDN: GET /eventmgmt/adom/{adom}/alert-incident/stats
+
+        This endpoint takes ``timescale``, ``timezone`` and ``time-range``
+        and nothing else. It used to be sent a ``type`` parameter carrying
+        values like "severity" / "severity-timescale"; no such parameter
+        exists on 7.6.6 or 8.0.0, so it was inert — a nonsense value and
+        "severity" returned byte-identical responses live. The breakdown
+        this endpoint returns is fixed; ``timescale`` only chooses the
+        bucket width.
+
+        Args:
+            timescale: Bucket width, "month" (default) or "hour".
+        """
+        return await self._raw_request_dict(
+            "get",
+            f"/eventmgmt/adom/{adom}/alert-incident/stats",
+            apiver=API_VERSION,
+            timescale=timescale,
+            **{"time-range": time_range},
+        )
+
+    # =========================================================================
+    # FortiView (from fortiview.json)
+    # =========================================================================
+
+    async def fortiview_run(
+        self,
+        adom: str,
+        view_name: str,
+        device: list[dict[str, str]] | None = None,
+        time_range: dict[str, str] | None = None,
+        filter: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+        sort_by: list[dict[str, str]] | None = None,
+        case_sensitive: bool = False,
+    ) -> dict[str, Any]:
+        """Start a FortiView request.
+
+        FNDN: ADD /fortiview/adom/{adom}/{view-name}/run
+
+        This is a two-step operation:
+        1. Start FortiView request (returns TID)
+        2. Fetch results using TID
+
+        Args:
+            adom: ADOM name
+            view_name: FortiView name (e.g., "top-sources", "top-destinations",
+                       "top-applications", "top-threats", "top-websites", "policy-line", etc.)
+            device: Device filter list [{"devname": "FGT..."}, ...], defaults to All_Device
+            time_range: {"start": "2024-01-01 00:00:00", "end": "2024-01-02 00:00:00"}
+            filter: Filter expression
+            limit: Max records (1-1000)
+            offset: Record offset
+            sort_by: Sort criteria [{"field": "counts", "order": "desc"}]
+            case_sensitive: Whether filter is case-sensitive (default: False)
+
+        Returns:
+            {"tid": 12345} - Task ID for fetching results
+        """
+        # Default to All_Device if no device specified
+        if not device:
+            device = [{"devname": "All_Device"}]
+
+        params: dict[str, Any] = {
+            "apiver": API_VERSION,
+            "case-sensitive": case_sensitive,
+            "device": device,
+            "time-range": time_range or {},
+            "limit": limit,
+            "offset": offset,
+        }
+        if filter:
+            params["filter"] = filter
+        if sort_by:
+            params["sort-by"] = sort_by
+
+        return await self._raw_request_dict(
+            "add", f"/fortiview/adom/{adom}/{view_name}/run", **params
+        )
+
+    async def fortiview_fetch(
+        self,
+        adom: str,
+        view_name: str,
+        tid: int,
+    ) -> dict[str, Any]:
+        """Fetch FortiView results by task ID.
+
+        FNDN: GET /fortiview/adom/{adom}/{view-name}/run/{tid}
+        """
+        return await self._raw_request_dict(
+            "get",
+            f"/fortiview/adom/{adom}/{view_name}/run/{tid}",
+            apiver=API_VERSION,
+        )
+
+    # =========================================================================
+    # Report (from report.json)
+    # =========================================================================
+
+    async def get_report_layouts(
+        self,
+        adom: str,
+        fields: list[str] | None = None,
+        filter: list[Any] | None = None,
+    ) -> dict[str, Any]:
+        """Get available report layouts.
+
+        FNDN: GET /config/adom/{adom}/sql-report/layout
+
+        Returns list of report layouts with their layout-id, title, description, etc.
+        The layout-id is required for running reports.
+
+        Args:
+            adom: ADOM name
+            fields: Optional list of fields to return
+            filter: Optional filter criteria
+        """
+        params: dict[str, Any] = {
+            "apiver": API_VERSION,
+            "loadsub": 0,
+        }
+        if fields:
+            params["fields"] = fields
+        if filter:
+            params["filter"] = filter
+
+        return await self._raw_request_dict(
+            "get", f"/config/adom/{adom}/sql-report/layout", **params
+        )
+
+    async def report_run(
+        self,
+        adom: str,
+        layout_id: int,
+        time_period: str | None = "last-7-days",
+        device: list[dict[str, str]] | None = None,
+        period_start: str | None = None,
+        period_end: str | None = None,
+    ) -> dict[str, Any]:
+        """Run a report.
+
+        FNDN: ADD /report/adom/{adom}/run
+
+        This is a two-step operation:
+        1. Start report (returns TID)
+        2. Fetch report data using TID
+
+        Args:
+            adom: ADOM name
+            layout_id: Report layout ID (from get_report_layouts).
+                       A schedule must exist for this layout before running.
+            time_period: Preset time period for the report, e.g. "last-1-hours",
+                "last-7-days", "last-30-days", "last-4-weeks". Ignored when a
+                custom window (period_start + period_end) is supplied.
+            device: Device filter list [{"devname": "myfw01"}, ...], or None.
+            period_start: Custom window start as a FortiOS ``timedate`` string
+                ("HH:MM yyyy/mm/dd"). When both period_start and period_end are
+                given, the run uses a custom window instead of ``time_period``.
+            period_end: Custom window end as a FortiOS ``timedate`` string.
+
+        A custom window is delivered inside the nested ``schedule-param`` object
+        with ``time-period="other"`` (the string form; the numeric schedule-
+        config code is rejected here) and the two ``timedate`` bounds — NOT as a
+        top-level ``schedule`` with flat period fields. Live-verified on 7.6.7
+        and 8.0.0: the flat run form and the schedule-config object both fail to
+        scope a custom window (ignored / empty report); only nested
+        ``schedule-param`` with ``"other"`` produces the requested period.
+        """
+        if period_start and period_end:
+            # Custom window: nested schedule-param, no top-level "schedule".
+            schedule_param: dict[str, Any] = {
+                "layout-id": layout_id,
+                "device": device if device else "all",
+                "filter-logic": "all",
+                "time-period": "other",
+                "period-start": period_start,
+                "period-end": period_end,
+            }
+            params: dict[str, Any] = {
+                "apiver": API_VERSION,
+                "runfrom": "GUI",
+                "schedule-param": schedule_param,
+            }
+        else:
+            # Preset: flat form. schedule is the layout-id as a string.
+            params = {
+                "apiver": API_VERSION,
+                "schedule": str(layout_id),
+                "time-period": time_period,
+                "runfrom": "GUI",
+            }
+            if device:
+                params["device"] = device
+
+        return await self._raw_request_dict("add", f"/report/adom/{adom}/run", **params)
+
+    async def report_fetch(
+        self,
+        adom: str,
+        tid: str,
+    ) -> dict[str, Any]:
+        """Fetch report status/results by task ID.
+
+        FNDN: GET /report/adom/{adom}/run/{tid}
+
+        Args:
+            adom: ADOM name
+            tid: Task ID (UUID string from report_run)
+        """
+        return await self._raw_request_dict(
+            "get", f"/report/adom/{adom}/run/{tid}", apiver=API_VERSION
+        )
+
+    async def report_get_data(
+        self,
+        adom: str,
+        tid: str,
+        output_format: str = "PDF",
+        data_type: str = "string",
+    ) -> dict[str, Any]:
+        """Get report data/download.
+
+        FNDN: GET /report/adom/{adom}/reports/data/{tid}
+
+        Args:
+            adom: ADOM name
+            tid: Task ID (UUID string from report_run)
+            output_format: Output format - "PDF", "HTML", "CSV", "XML"
+            data_type: Data encoding type - "string" (base64)
+        """
+        return await self._raw_request_dict(
+            "get",
+            f"/report/adom/{adom}/reports/data/{tid}",
+            apiver=API_VERSION,
+            format=output_format,
+            **{"data-type": data_type},
+        )
+
+    async def report_list_templates(
+        self,
+        adom: str,
+    ) -> dict[str, Any]:
+        """List available report templates.
+
+        FNDN: GET /report/adom/{adom}/template/list
+        """
+        return await self._raw_request_dict(
+            "get", f"/report/adom/{adom}/template/list", apiver=API_VERSION
+        )
+
+    async def report_get_state(
+        self,
+        adom: str,
+        time_range: dict[str, str],
+        state: str = "generated",
+        title: str | None = None,
+    ) -> dict[str, Any]:
+        """Get report state/history.
+
+        FNDN: GET /report/adom/{adom}/reports/state
+
+        Args:
+            adom: ADOM name
+            time_range: {"start": "2024-01-01 00:00:00", "end": "2024-01-02 00:00:00"}
+            state: Report state filter ("generated", "pending", "running", etc.)
+            title: Optional report title filter
+        """
+        params: dict[str, Any] = {
+            "apiver": API_VERSION,
+            "state": state,
+            "time-range": time_range,
+        }
+        if title:
+            params["title"] = title
+
+        return await self._raw_request_dict("get", f"/report/adom/{adom}/reports/state", **params)
+
+    async def get_report_schedules(
+        self,
+        adom: str,
+        layout_id: int | None = None,
+    ) -> dict[str, Any]:
+        """Get report schedules.
+
+        FNDN: GET /config/adom/{adom}/sql-report/schedule
+
+        A schedule must exist for a layout before a report can be run.
+        The schedule name matches the layout-id.
+
+        Args:
+            adom: ADOM name
+            layout_id: Optional layout-id to filter by (schedule name == layout-id)
+        """
+        params: dict[str, Any] = {
+            "apiver": API_VERSION,
+            "loadsub": 1,
+        }
+        if layout_id is not None:
+            params["filter"] = ["name", "==", str(layout_id)]
+
+        return await self._raw_request_dict(
+            "get", f"/config/adom/{adom}/sql-report/schedule", **params
+        )
+
+    async def get_report_schedule(
+        self,
+        adom: str,
+        layout_id: int,
+    ) -> dict[str, Any]:
+        """Get one report schedule CONFIG object (period fields included).
+
+        FNDN: GET /config/adom/{adom}/sql-report/schedule/{schedule}
+
+        Unlike :meth:`get_report_schedules` (report-API listing), this reads the
+        raw config object, which is where time-period / period-start /
+        period-end live.
+        """
+        return await self._raw_request_dict(
+            "get",
+            f"/config/adom/{adom}/sql-report/schedule/{layout_id}",
+            apiver=API_VERSION,
+        )
+
+    async def update_report_schedule(
+        self,
+        adom: str,
+        layout_id: int,
+        fields: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Update fields on a report schedule CONFIG object.
+
+        FNDN: UPDATE /config/adom/{adom}/sql-report/schedule/{schedule}
+
+        Used to set a custom report window (time-period=16 "other" +
+        period-start/period-end) before a run, and to restore the previous
+        period afterwards. ``time-period`` is a NUMERIC enum on this object.
+        """
+        return await self._raw_request_dict(
+            "update",
+            f"/config/adom/{adom}/sql-report/schedule/{layout_id}",
+            apiver=API_VERSION,
+            data=fields,
+        )
+
+    async def create_report_schedule(
+        self,
+        adom: str,
+        layout_id: int,
+        device_filter: list[dict[str, str]] | None = None,
+    ) -> dict[str, Any]:
+        """Create a report schedule for a layout.
+
+        FNDN: SET /report/adom/{adom}/config/schedule/{layout_id}
+
+        A schedule must be created before running a report for a layout.
+
+        Args:
+            adom: ADOM name
+            layout_id: Layout ID to create schedule for
+            device_filter: Optional device filter list
+        """
+        data: dict[str, Any] = {
+            "auto-hcache": 1,
+            "report-layout": [{"layout-id": str(layout_id)}],
+        }
+        if device_filter:
+            data["device"] = device_filter
+
+        return await self._raw_request_dict(
+            "set",
+            f"/report/adom/{adom}/config/schedule/{layout_id}",
+            apiver=API_VERSION,
+            data=data,
+        )
+
+    async def get_running_reports(
+        self,
+        adom: str,
+    ) -> dict[str, Any]:
+        """Get currently running reports.
+
+        FNDN: GET /report/adom/{adom}/run
+
+        Returns list of reports currently being generated.
+        """
+        return await self._raw_request_dict("get", f"/report/adom/{adom}/run", apiver=API_VERSION)
+
+    # =========================================================================
+    # Incident Management (from incidentmgmt.json)
+    # =========================================================================
+
+    async def get_incidents(
+        self,
+        adom: str,
+        time_range: dict[str, str] | None = None,
+        filter: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        """Get incidents.
+
+        FNDN: GET /incidentmgmt/adom/{adom}/incidents
+
+        ``time-range`` is UNDOCUMENTED here but VERIFIED WORKING. The
+        parameter table lists only ``incids``, ``filter``, ``sort-by``,
+        ``limit``, ``offset`` and ``detail-level`` on 7.6.6 and 8.0.0, while
+        ``/incident/stats`` and ``/eventmgmt/alerts`` list it explicitly —
+        yet the appliance filters on it here exactly as it does there.
+
+        Measured on 7.6.6 build 3654 against a single incident (createtime
+        epoch 1785489898), on ``/incidents`` and ``/incidents/count`` alike:
+
+            window covering createtime -> 1
+            window in year 2000        -> 0
+            window in year 2099        -> 0
+            time-range omitted         -> 1
+
+        which is the same pattern the documented ``/incident/stats`` returns
+        for the same four windows. So DO NOT "clean this up" by removing the
+        parameter on the strength of the parameter table: that silently
+        widens every incident query from "last 24h" to ADOM-wide, truncated
+        by ``limit``. This API under-reports itself in more than one place —
+        logtypes 20-28 are absent from the same document and live on the
+        appliance.
+
+        Note for anyone re-testing: malformed-value probing does NOT work
+        here. FAZ silently degrades bad dates to "all" even on endpoints
+        that document the field, so only a well-formed window over an
+        endpoint holding data discriminates.
+        """
+        params: dict[str, Any] = {
+            "apiver": API_VERSION,
+            "limit": limit,
+            "offset": offset,
+        }
+        if time_range:
+            params["time-range"] = time_range
+        if filter:
+            params["filter"] = filter
+
+        return await self._raw_request_dict("get", f"/incidentmgmt/adom/{adom}/incidents", **params)
+
+    async def get_incident(
+        self,
+        adom: str,
+        incident_id: str,
+    ) -> dict[str, Any]:
+        """Get specific incident details.
+
+        FNDN: GET /incidentmgmt/adom/{adom}/incidents (incids=[...])
+
+        There is no single-incident GET endpoint — ``incident/{incid}``
+        exists only as an update path. Retrieval goes through the plural
+        ``incidents`` endpoint with an ``incids`` list at the default
+        (standard) detail level: "extended" adds eparr/euarr/attachments
+        but drops ``severity``/``status`` (verified live), which callers
+        need.
+        """
+        result = await self._raw_request_dict(
+            "get",
+            f"/incidentmgmt/adom/{adom}/incidents",
+            apiver=API_VERSION,
+            incids=[incident_id],
+        )
+        data = result.get("data") if isinstance(result, dict) else None
+        if isinstance(data, list):
+            if not data:
+                raise APIError(f"Incident {incident_id} not found")
+            return cast(dict[str, Any], data[0])
+        return result
+
+    async def get_incidents_count(
+        self,
+        adom: str,
+        time_range: dict[str, str] | None = None,
+        filter: str | None = None,
+    ) -> dict[str, Any]:
+        """Get incident count.
+
+        FNDN: GET /incidentmgmt/adom/{adom}/incidents/count
+
+        Documents ``incids`` and ``filter`` only; ``time-range`` is
+        undocumented here but verified to filter — see ``get_incidents``
+        for the measurement.
+        """
+        params: dict[str, Any] = {"apiver": API_VERSION}
+        if time_range:
+            params["time-range"] = time_range
+        if filter:
+            params["filter"] = filter
+
+        return await self._raw_request_dict(
+            "get", f"/incidentmgmt/adom/{adom}/incidents/count", **params
+        )
+
+    async def create_incident(
+        self,
+        adom: str,
+        endpoint: str,
+        category: str,
+        reporter: str = "faz-mcp",
+        severity: str = "medium",
+        status: str | None = None,
+        description: str | None = None,
+        epid: int | None = None,
+        euid: int | None = None,
+        name: str | None = None,
+    ) -> dict[str, Any]:
+        """Create a new incident.
+
+        FNDN: ADD /incidentmgmt/adom/{adom}/incident
+
+        ``reporter``, ``endpoint`` and ``category`` are required by the API
+        on 7.6.7 and 8.0.0. ``name`` is absent from the spec but the
+        appliance persists it on the incident record, so it stays exposed.
+
+        The ADD success response carries ``incid`` at the TOP level (no
+        ``data`` wrapper), unlike get_incident where the record arrives
+        under ``data``. Asymmetric on purpose; do not "fix" one to match
+        the other.
+        """
+        params: dict[str, Any] = {
+            "apiver": API_VERSION,
+            "reporter": reporter,
+            "endpoint": endpoint,
+            "category": category,
+            "severity": severity,
+        }
+        if status:
+            params["status"] = status
+        if description:
+            params["description"] = description
+        if epid is not None:
+            params["epid"] = epid
+        if euid is not None:
+            params["euid"] = euid
+        if name:
+            params["name"] = name
+
+        return await self._raw_request_dict("add", f"/incidentmgmt/adom/{adom}/incident", **params)
+
+    async def update_incident(
+        self,
+        adom: str,
+        incident_id: str,
+        status: str | None = None,
+        severity: str | None = None,
+        last_user: str | None = None,
+    ) -> dict[str, Any]:
+        """Update an incident.
+
+        FNDN: UPDATE /incidentmgmt/adom/{adom}/incident/{incid}
+
+        Accepts ``lastuser``, ``epid``, ``endpoint``, ``euid``, ``category``,
+        ``severity``, ``status``, ``description`` and ``lastrevision``. There
+        is no ``assignee`` field on 7.6.6 or 8.0.0 — one used to be sent and
+        was silently dropped, so an "assign this incident" call reported
+        success while changing nothing. ``lastuser`` (who last touched the
+        record) is documented, is a real field, and is what the
+        ownership-ish argument now maps to.
+
+        Open question worth a probe when a write-capable token exists: an
+        incident record carries an ``assigned_to`` field (seen live on 7.6.6),
+        which is semantically what ``assignee`` was reaching for — but it is
+        absent from this endpoint's documented parameter list, so whether it
+        is settable here is unknown. ``lastuser`` is an audit stamp, not an
+        assignment; if ``assigned_to`` turns out to be writable, real
+        assignment support belongs on top of it rather than replacing this.
+        """
+        params: dict[str, Any] = {"apiver": API_VERSION}
+        if status:
+            params["status"] = status
+        if severity:
+            params["severity"] = severity
+        if last_user:
+            params["lastuser"] = last_user
+
+        return await self._raw_request_dict(
+            "update", f"/incidentmgmt/adom/{adom}/incident/{incident_id}", **params
+        )
+
+    async def get_incident_stats(
+        self,
+        adom: str,
+        time_range: dict[str, str],
+        stats_items: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Get incident statistics.
+
+        FNDN: GET /incidentmgmt/adom/{adom}/incident/stats
+
+        Args:
+            adom: ADOM name
+            time_range: {"start": "...", "end": "..."}
+            stats_items: List of stats items to retrieve. Options:
+                - "total": Total incident count
+                - "severity": Counts by severity (high/medium/low)
+                - "category": Counts by category
+                - "status": Counts by status
+                - "outbreak": Outbreak incidents
+                Default: ["total", "severity", "status"]
+        """
+        if stats_items is None:
+            stats_items = ["total", "severity", "status"]
+
+        return await self._raw_request_dict(
+            "get",
+            f"/incidentmgmt/adom/{adom}/incident/stats",
+            apiver=API_VERSION,
+            **{"time-range": time_range, "stats-item": stats_items},
+        )
+
+    # =========================================================================
+    # IOC (Indicators of Compromise) (from ioc.json)
+    # =========================================================================
+
+    async def get_ioc_license_state(self) -> dict[str, Any]:
+        """Get IOC license state.
+
+        FNDN: GET /ioc/license/state
+        """
+        return await self._raw_request_dict("get", "/ioc/license/state", apiver=API_VERSION)
+
+    async def acknowledge_ioc_events(
+        self,
+        adom: str,
+        events: list[dict[str, str]],
+        comment: str | None = None,
+    ) -> dict[str, Any]:
+        """Acknowledge IOC events.
+
+        FNDN: UPDATE /ioc/adom/{adom}/events/ack
+
+        An IOC event is not addressed by an opaque id — it is identified by
+        the endpoint it fired on plus when it fired. The payload is an
+        ``events`` array of ``{endpoint-id, source-ip, timestamp, comment}``
+        objects. This previously sent ``eventid`` (a flat id list) and
+        ``update-by``; neither string occurs anywhere in the IOC spec on
+        7.6.6 or 8.0.0.
+
+        Args:
+            adom: ADOM name
+            events: Event identities to acknowledge. Each entry carries
+                ``endpoint-id`` and/or ``source-ip`` plus ``timestamp``.
+            comment: Optional acknowledgement note applied to every entry
+                that does not already carry its own ``comment``.
+        """
+        payload = [dict(event) for event in events]
+        if comment:
+            for event in payload:
+                event.setdefault("comment", comment)
+
+        return await self._raw_request_dict(
+            "update",
+            f"/ioc/adom/{adom}/events/ack",
+            apiver=API_VERSION,
+            events=payload,
+        )
+
+    async def ioc_rescan_run(
+        self,
+        adom: str,
+        device: list[dict[str, str]],
+        time_range: dict[str, str],
+    ) -> dict[str, Any]:
+        """Run IOC rescan.
+
+        FNDN: ADD /ioc/adom/{adom}/rescan/run — UNDOCUMENTED.
+
+        The IOC module documents exactly five operations on 7.6.6 and 8.0.0
+        (``update /events/ack``, ``get /license/state``, ``get /rescan/run``,
+        ``get /rescan/history``, ``delete /rescan/run/{tid}``) and no way to
+        *start* a rescan is among them. This add-verb call is the shipped
+        behaviour and is left as-is rather than guessed at, but it is not
+        spec-backed: treat a failure here as "the endpoint moved", not as a
+        transient error. Same for the tid-scoped status read in
+        ``ioc_rescan_status``.
+
+        Returns TID for tracking.
+        """
+        return await self._raw_request_dict(
+            "add",
+            f"/ioc/adom/{adom}/rescan/run",
+            apiver=API_VERSION,
+            device=device,
+            **{"time-range": time_range},
+        )
+
+    async def ioc_rescan_status(
+        self,
+        adom: str,
+        tid: int,
+    ) -> dict[str, Any]:
+        """Get IOC rescan status.
+
+        FNDN: GET /ioc/adom/{adom}/rescan/run/{tid} — UNDOCUMENTED.
+
+        The spec defines ``{tid}`` on this path only under ``delete``; the
+        documented status read is the tid-less ``get /rescan/run``, which
+        returns the single running task's ``tid``, ``percentage``,
+        ``status`` and ``threats-count``. The tid-scoped form is kept
+        because it is what ships and switching a live polling path on spec
+        reading alone is not verifiable from an idle lab — but if this
+        starts returning the wrong task, the tid-less endpoint is the
+        documented answer.
+        """
+        return await self._raw_request_dict(
+            "get", f"/ioc/adom/{adom}/rescan/run/{tid}", apiver=API_VERSION
+        )
+
+    async def get_ioc_rescan_history(
+        self,
+        adom: str,
+    ) -> dict[str, Any]:
+        """Get IOC rescan history.
+
+        FNDN: GET /ioc/adom/{adom}/rescan/history
+        """
+        return await self._raw_request_dict(
+            "get", f"/ioc/adom/{adom}/rescan/history", apiver=API_VERSION
+        )
+
+    # =========================================================================
+    # UEBA - Endpoints & End-users (from ueba.json) — Wave 2 skills readers
+    # Read-only. Feature-gated: requires UEBA licensed/enabled on the FAZ.
+    # Endpoints identical on 7.6.7 and 8.0.0 (verified).
+    # =========================================================================
+
+    async def get_endpoints(
+        self,
+        adom: str,
+        epids: list[int] | None = None,
+        detail_level: str = "standard",
+        time_range: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """Get UEBA endpoint (asset) records.
+
+        FNDN: GET /ueba/adom/{adom}/endpoints
+
+        Args:
+            adom: ADOM name
+            epids: Optional endpoint IDs to scope the query
+            detail_level: "simple", "basic" or "standard"
+            time_range: {"start": ..., "end": ...} first-seen window
+        """
+        params: dict[str, Any] = {"apiver": API_VERSION, "detail-level": detail_level}
+        if epids:
+            params["epids"] = epids
+        if time_range:
+            params["time-range"] = time_range
+        return await self._request_dict("get", f"/ueba/adom/{adom}/endpoints", **params)
+
+    async def get_endpoint_vulnerabilities(
+        self,
+        adom: str,
+        epids: list[int] | None = None,
+        detectby: str | None = None,
+    ) -> dict[str, Any]:
+        """Get CVE/vulnerability records for UEBA endpoints.
+
+        FNDN: GET /ueba/adom/{adom}/endpoints/vuln
+
+        Args:
+            adom: ADOM name
+            epids: Optional endpoint IDs to scope the query
+            detectby: Optional detector filter ("FortiClient" or "FortiGate")
+        """
+        params: dict[str, Any] = {"apiver": API_VERSION}
+        if epids:
+            params["epids"] = epids
+        if detectby:
+            params["detectby"] = detectby
+        return await self._request_dict("get", f"/ueba/adom/{adom}/endpoints/vuln", **params)
+
+    async def get_endusers(
+        self,
+        adom: str,
+        euids: list[int] | None = None,
+        detail_level: str = "standard",
+    ) -> dict[str, Any]:
+        """Get UEBA end-user (identity) records.
+
+        FNDN: GET /ueba/adom/{adom}/endusers
+
+        Args:
+            adom: ADOM name
+            euids: Optional end-user IDs to scope the query
+            detail_level: "basic", "standard" or "extended" (extended adds
+                email/department/title/phone)
+        """
+        params: dict[str, Any] = {"apiver": API_VERSION, "detail-level": detail_level}
+        if euids:
+            params["euids"] = euids
+        return await self._request_dict("get", f"/ueba/adom/{adom}/endusers", **params)
+
+    async def get_endpoint_stats(
+        self,
+        adom: str,
+        time_range: dict[str, str],
+        filter: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Get UEBA endpoint stat counts for a time window.
+
+        FNDN: GET /ueba/adom/{adom}/endpoints/stats
+
+        Returns an ADOM-wide aggregate count snapshot for the window (a
+        single-element list holding total/new/identified/unidentified
+        endpoint counts). Not per-entity and not a time series. The FAZ
+        rejects the request unless a ``time-range`` is supplied.
+
+        Args:
+            adom: ADOM name
+            time_range: {"start": ..., "end": ...} window (required by FAZ)
+            filter: Optional query filter, e.g. "category=IOT"
+        """
+        params: dict[str, Any] = {"apiver": API_VERSION, "time-range": time_range}
+        if filter:
+            params["filter"] = filter
+        result = await self.get(f"/ueba/adom/{adom}/endpoints/stats", **params)
+        if isinstance(result, list):
+            return cast(list[dict[str, Any]], result)
+        return [result] if result else []
+
+    async def get_enduser_stats(
+        self,
+        adom: str,
+        time_range: dict[str, str],
+        stats_item: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Get UEBA end-user stat counts for a time window.
+
+        FNDN: GET /ueba/adom/{adom}/endusers/stats
+
+        Returns an ADOM-wide aggregate count object (total/new end-user
+        counts) for the window. Not per-entity and not a time series. The
+        FAZ rejects the request unless BOTH ``stats-item`` and a
+        ``time-range`` are supplied.
+
+        Args:
+            adom: ADOM name
+            time_range: {"start": ..., "end": ...} window (required by FAZ)
+            stats_item: Requested stat types (default: ["total-count",
+                "new-count"]); the FAZ requires this alongside time-range
+        """
+        items = stats_item if stats_item else ["total-count", "new-count"]
+        params: dict[str, Any] = {
+            "apiver": API_VERSION,
+            "time-range": time_range,
+            "stats-item": items,
+        }
+        return await self._request_dict("get", f"/ueba/adom/{adom}/endusers/stats", **params)
+
+    async def get_alert_handlers(
+        self,
+        adom: str,
+        handler_type: str = "both",
+    ) -> dict[str, Any]:
+        """Get event alert-handler (detection-rule) definitions.
+
+        FNDN: GET /eventmgmt/adom/{adom}/config/basic-handler
+              GET /eventmgmt/adom/{adom}/config/correlation-handler
+
+        Args:
+            adom: ADOM name
+            handler_type: "basic", "correlation" or "both"
+        """
+        result: dict[str, Any] = {}
+        if handler_type in ("basic", "both"):
+            result["basic"] = await self._raw_request_dict(
+                "get", f"/eventmgmt/adom/{adom}/config/basic-handler", apiver=API_VERSION
+            )
+        if handler_type in ("correlation", "both"):
+            result["correlation"] = await self._raw_request_dict(
+                "get", f"/eventmgmt/adom/{adom}/config/correlation-handler", apiver=API_VERSION
+            )
+        return result
+
+    # =========================================================================
+    # SOAR - Indicator reads (from soar.json) — Wave 2 threat-intel readers
+    # Read-only. The bare /indicator/enrichment path is ADD-only; the GET
+    # reads are /indicator, /alert/indicator, /incident/indicator and
+    # /indicator/enrichment/{uuid}. Feature-gated: requires SOAR licensed.
+    # =========================================================================
+
+    _NIL_UUID = "00000000-0000-0000-0000-000000000000"
+
+    # SOAR indicator reads apply a default 7-day time-range when the request
+    # omits one (documented in the FNDN soar.indicator.get spec), which hides
+    # older indicators. This unbounded window matches the GUI's "show all"
+    # behaviour; callers narrow it via the ``time_range`` argument.
+    #
+    # Scope note: only the indicator LIST endpoint (/soar/adom/{adom}/indicator)
+    # documents time-range. /alert/indicator and /incident/indicator take just
+    # alert-id / incident-id plus filter, so the window sent to those two is
+    # inert — harmless, and kept so all four reads share one code path.
+    _WIDE_TIME_RANGE = {"start": "1970-01-01 00:00:00", "end": "2099-12-31 23:59:59"}
+
+    async def get_linked_indicators(
+        self,
+        adom: str,
+        alert_id: str | None = None,
+        incident_id: str | None = None,
+        filter: str | None = None,
+        time_range: dict[str, str] | None = None,
+    ) -> Any:
+        """Get IOC indicators linked to an alert or an incident.
+
+        FNDN: GET /soar/adom/{adom}/alert/indicator     (alert-id)
+              GET /soar/adom/{adom}/incident/indicator  (incident-id)
+
+        Exactly one of ``alert_id`` / ``incident_id`` must be given. A
+        ``time-range`` is always sent (default: unbounded) because the SOAR
+        API otherwise filters to the last 7 days and drops older indicators.
+        """
+        params: dict[str, Any] = {
+            "apiver": API_VERSION,
+            "time-range": time_range or self._WIDE_TIME_RANGE,
+        }
+        if filter:
+            params["filter"] = filter
+        if alert_id:
+            params["alert-id"] = alert_id
+            return await self.get(f"/soar/adom/{adom}/alert/indicator", **params)
+        if incident_id:
+            params["incident-id"] = incident_id
+            return await self.get(f"/soar/adom/{adom}/incident/indicator", **params)
+        raise ValueError("provide exactly one of alert_id or incident_id")
+
+    async def get_indicator_enrichment(
+        self,
+        adom: str,
+        indicator_value: str,
+        indicator_type: str,
+        enrichment_uuid: str | None = None,
+        detail_level: str = "standard",
+        time_range: dict[str, str] | None = None,
+    ) -> Any:
+        """Get IOC reputation/enrichment for an indicator.
+
+        The reputation lives on the indicator list endpoint
+        (``/soar/adom/{adom}/indicator``): each row carries
+        ``enrichment-reputation`` (Good/Suspicious/Malicious/
+        NoReputationAvailable), ``enrichment-confidence`` (0-100),
+        ``enrichment-status`` and an ``enrichment-uuid``. The reader resolves
+        the indicator by a ``value``/``type`` filter and, for
+        ``detail_level="extended"``, follows the row's real ``enrichment-uuid``
+        to ``/indicator/enrichment/{uuid}`` for the raw source detail.
+
+        A ``time-range`` is always sent (default: unbounded) — the SOAR API
+        otherwise applies a 7-day default and returns nothing for an indicator
+        seen earlier. ``enrichment_uuid``, when supplied, addresses the detail
+        endpoint directly and skips the value lookup.
+        """
+        tr = time_range or self._WIDE_TIME_RANGE
+
+        # Direct-by-uuid path (caller already has the enrichment uuid).
+        if enrichment_uuid and enrichment_uuid != self._NIL_UUID:
+            return await self.get(
+                f"/soar/adom/{adom}/indicator/enrichment/{enrichment_uuid}",
+                apiver=API_VERSION,
+                **{"detail-level": detail_level, "time-range": tr},
+            )
+
+        # Resolve the indicator by value+type on the list endpoint, where the
+        # enrichment fields are returned inline. The value is single-quoted in
+        # the filter expression, so reject an embedded quote up front (an IP /
+        # URL / domain never legitimately contains one).
+        if "'" in indicator_value:
+            raise ValueError("indicator_value must not contain a single quote")
+        filter_expr = f"value=='{indicator_value}' and type=='{indicator_type}'"
+        result = await self.get(
+            f"/soar/adom/{adom}/indicator",
+            apiver=API_VERSION,
+            limit=100,
+            filter=filter_expr,
+            **{"time-range": tr},
+        )
+        rows = result if isinstance(result, list) else (result.get("data") or [])
+
+        if detail_level == "extended":
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                euid = row.get("enrichment-uuid")
+                if euid and euid != self._NIL_UUID:
+                    try:
+                        row["enrichment-detail"] = await self.get(
+                            f"/soar/adom/{adom}/indicator/enrichment/{euid}",
+                            apiver=API_VERSION,
+                            **{"detail-level": "extended", "time-range": tr},
+                        )
+                    except Exception as exc:  # detail is best-effort enrichment
+                        logger.warning("enrichment detail fetch failed for %s: %s", euid, exc)
+        return rows

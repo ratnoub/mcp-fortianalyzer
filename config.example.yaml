@@ -1,0 +1,39 @@
+# Example configuration for mcp-fortianalyzer.
+#
+# Copy this file to `config.yaml` and fill in your own values:
+#
+#     cp config.example.yaml config.yaml
+#
+# `config.yaml` is gitignored so your real credentials are never committed.
+# Every value can also be overridden with an environment variable (see README).
+
+config:
+  fortianalyzer:
+    # FortiAnalyzer appliance address (no scheme, no trailing slash).
+    host: 192.0.2.10
+
+    # API token (preferred) or username/password pair.
+    api_key: <your-fortianalyzer-api-token>
+    # username: admin
+    # password: <your-password>
+
+    # Set to true to verify the appliance TLS certificate.
+    verify_ssl: false
+
+    # Logging: DEBUG, INFO, WARNING, ERROR.
+    log_level: info
+
+    # ADOM used when a tool call does not specify one.
+    default_adom: root
+
+    # Bearer token that protects the HTTP endpoint (http://<IP>:5750/mcp).
+    # Clients must send it as `Authorization: Bearer <token>`.
+    # Leave unset to have the server generate a random token at startup.
+    auth_token: <your-http-auth-token>
+
+    # Optional tuning:
+    # timeout: 30
+    # max_retries: 3
+    # ca_bundle: /path/to/ca-bundle.pem
+    # log_file: /var/log/mcp-fortianalyzer.log
+    # log_format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
