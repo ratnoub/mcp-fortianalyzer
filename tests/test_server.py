@@ -23,7 +23,7 @@ def _tool_names() -> list[str]:
 def test_server_registers_tools() -> None:
     """The server registers a non-trivial set of tools."""
     names = _tool_names()
-    assert len(names) >= 60, f"expected >= 60 tools, got {len(names)}"
+    assert len(names) == 71, f"expected 71 tools, got {len(names)}"
 
 
 def test_no_add_delete_create_tools() -> None:
@@ -37,4 +37,16 @@ def test_core_tools_present() -> None:
     """A few well-known read tools are present."""
     names = set(_tool_names())
     for expected in ("list_adoms", "get_system_status", "query_logs"):
+        assert expected in names, f"expected tool {expected!r} to be registered"
+
+
+def test_reporting_and_archive_tools_present() -> None:
+    """Reporting schedule visibility and archived-log tools are exposed."""
+    names = set(_tool_names())
+    for expected in (
+        "list_report_schedules",
+        "get_report_schedule_details",
+        "search_archived_logs",
+        "get_archived_log_data",
+    ):
         assert expected in names, f"expected tool {expected!r} to be registered"

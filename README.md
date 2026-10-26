@@ -63,6 +63,9 @@ python -m pipx ensurepath
 
 # Install this project (from a clone of the repository)
 pipx install .
+
+# or straight from GitHub
+pipx install "git+https://github.com/ratnoub/mcp-fortianalyzer.git"
 ```
 
 `pipx install .` builds the package and exposes the `mcp-fortianalyzer`
@@ -178,7 +181,7 @@ Add to `claude_desktop_config.json`:
 
 ## Tools
 
-The server registers **67 tools** across the areas below. All are read/query
+The server registers **71 tools** across the areas below. All are read/query
 operations plus the update/acknowledge workflow steps; the add/delete/create
 tools are intentionally omitted.
 
@@ -233,7 +236,7 @@ tools are intentionally omitted.
 | `run_and_wait_ioc_rescan` | Run IOC rescan and wait for completion.  Convenience function that starts an IOC rescan and polls until completion. Handles the TID workflow automatically. |
 | `run_ioc_rescan` | Start an IOC rescan.  Initiates a rescan of historical logs against current IOC database. Returns a TID for tracking the rescan progress. |
 
-### Logs (8)
+### Logs (10)
 
 | Tool | Description |
 |------|-------------|
@@ -243,6 +246,8 @@ tools are intentionally omitted.
 | `get_log_search_progress` | Report status of a query_logs pagination handle.  query_logs runs each search synchronously (it returns only after the page has completed), and a FortiAnalyzer logsearch task is single-use and reaped on completion. There is therefore no separately pollable in-progress task: a known handle is already complete. Use fetch_more_logs(tid=...) to retrieve further pages. |
 | `get_log_stats` | Get log statistics for an ADOM.  Returns statistics about log storage, rates, and device logging status. |
 | `get_logfiles_state` | Get log file state information.  Lists available log files on disk for a device/VDOM. |
+| `search_archived_logs` | Search records inside an archived FortiAnalyzer log file. Use `get_logfiles_state` to discover filenames. |
+| `get_archived_log_data` | Read a bounded byte range from an archived log file. |
 | `get_pcap_file` | Get PCAP file associated with a log entry.  Some logs (like IPS) include associated packet captures. This retrieves the PCAP file data. |
 | `query_logs` | Query logs from FortiAnalyzer log database.  This implements the two-step TID-based log search workflow: 1. Start search task (returns TID) 2. Poll for results until complete |
 
@@ -256,7 +261,7 @@ tools are intentionally omitted.
 | `search_and_download_pcaps` | Search for IPS events and download all matching PCAPs.  Convenience function that combines search_ips_logs and PCAP download into a single operation. Useful for bulk forensic collection. |
 | `search_ips_logs` | Search IPS/attack logs with advanced filtering.  Search FortiAnalyzer for IPS (Intrusion Prevention System) events with flexible filtering options. Returns log entries that can be used to download associated PCAP files.  This is the right entry point for IPS work -- it filters on CVE and PCAP availability, which query_logs(logtype="attack", filters=[...]) cannot. Note the returned `tid` is NOT a pagination handle (see Returns); raise `limit` instead of trying to page, and pass has_pcap=True when the goal is a PCAP download. |
 
-### Reports (9)
+### Reports (11)
 
 | Tool | Description |
 |------|-------------|
@@ -264,6 +269,8 @@ tools are intentionally omitted.
 | `get_report_data` | Download completed report data.  Retrieves the generated report content after completion. The report data is returned as base64-encoded content. |
 | `get_report_history` | Get report history - list of generated reports.  Retrieves list of completed/generated reports. |
 | `get_running_reports` | Get currently running reports.  Check the status of reports that are currently being generated. Use this after run_report() to monitor progress. |
+| `list_report_schedules` | List report schedules, optionally scoped to one layout. Read-only; does not create a missing schedule. |
+| `get_report_schedule_details` | Get a report schedule's configuration, including its period fields. Read-only. |
 | `list_report_layouts` | List available report layouts in FortiAnalyzer.  IMPORTANT: Layouts are runnable reports. Templates are read-only blueprints. When a user asks to "run a report", you need to search layouts, not templates.  Each layout has a layout-id which is required to run reports. A schedule must exist for the layout before it can be run (created automatically). |
 | `list_report_templates` | List available read-only report templates in FortiAnalyzer.  IMPORTANT: Templates are protected blueprints, not runnable reports. To run a report use list_report_layouts() + run_report() instead. Templates are typically cloned into custom layouts via the FortiAnalyzer GUI/CLI.  Returns templates served by the dedicated FAZ endpoint GET /report/adom/{adom}/template/list, which is distinct from the layout endpoint that list_report_layouts() uses. |
 | `run_and_wait_report` | Run a report and wait for completion.  IMPORTANT: This runs a LAYOUT, not a template. Use list_report_layouts() to see available reports.  Convenience function that: 1. Looks up the layout-id by title 2. Ensures a schedule exists 3. Runs the report 4. Polls until completion or timeout |

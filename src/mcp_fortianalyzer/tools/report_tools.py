@@ -331,6 +331,69 @@ async def list_report_templates(adom: str | None = None) -> dict[str, Any]:
 
 
 @mcp.tool(annotations=READ_ONLY)
+async def list_report_schedules(
+    adom: str | None = None,
+    layout_id: int | None = None,
+) -> dict[str, Any]:
+    """List report schedules, optionally scoped to one layout.
+
+    This read-only tool shows which runnable reports have schedules before
+    launch. It does not create a missing schedule.
+
+    Args:
+        adom: ADOM name (default: from config DEFAULT_ADOM)
+        layout_id: Optional report layout ID to narrow the result
+    """
+    try:
+        adom = validate_adom(adom or get_default_adom())
+        if layout_id is not None and layout_id < 0:
+            raise ValidationError("layout_id must be a non-negative integer")
+        client = _get_client()
+        result = await client.get_report_schedules(adom=adom, layout_id=layout_id)
+        data = result.get("data", []) if isinstance(result, dict) else result
+        if not isinstance(data, list):
+            data = [data] if data else []
+        return {"status": "success", "adom": adom, "count": len(data), "data": data}
+    except ValidationError as e:
+        return error_response(
+            error="validation_error", message=e, operation="list_report_schedules", adom=adom
+        )
+    except Exception as e:
+        logger.error(f"Failed to list report schedules: {e}")
+        return {"status": "error", "message": redact(str(e))}
+
+
+@mcp.tool(annotations=READ_ONLY)
+async def get_report_schedule_details(
+    layout_id: int,
+    adom: str | None = None,
+) -> dict[str, Any]:
+    """Get a report schedule's configuration, including its period fields.
+
+    Unlike list_report_schedules, this reads the raw config object.
+    It does not modify the schedule.
+
+    Args:
+        layout_id: Report layout/schedule ID
+        adom: ADOM name (default: from config DEFAULT_ADOM)
+    """
+    try:
+        adom = validate_adom(adom or get_default_adom())
+        if layout_id < 0:
+            raise ValidationError("layout_id must be a non-negative integer")
+        client = _get_client()
+        result = await client.get_report_schedule(adom=adom, layout_id=layout_id)
+        return {"status": "success", "adom": adom, "layout_id": layout_id, "data": result}
+    except ValidationError as e:
+        return error_response(
+            error="validation_error", message=e, operation="get_report_schedule_details", adom=adom
+        )
+    except Exception as e:
+        logger.error(f"Failed to get report schedule details: {e}")
+        return {"status": "error", "message": redact(str(e))}
+
+
+@mcp.tool(annotations=READ_ONLY)
 async def run_report(
     layout: str,
     adom: str | None = None,

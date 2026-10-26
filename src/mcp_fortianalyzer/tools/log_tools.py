@@ -1783,6 +1783,81 @@ async def get_logfiles_state(
 
 
 @mcp.tool(annotations=READ_ONLY)
+async def search_archived_logs(
+    device: str,
+    vdom: str,
+    filename: str,
+    logtype: str,
+    adom: str | None = None,
+    filter: str | None = None,
+    case_sensitive: bool = True,
+    limit: int = 50,
+    offset: int = 0,
+) -> dict[str, Any]:
+    """Search records inside an archived log file on FortiAnalyzer.
+
+    Use get_logfiles_state to discover filenames first. Unlike query_logs,
+    this searches the selected file on disk instead of the indexed database.
+    """
+    try:
+        adom = validate_adom(adom or get_default_adom())
+        if not device or not vdom or not filename:
+            raise ValidationError("device, vdom, and filename are required")
+        validate_log_type(logtype)
+        if not 1 <= limit <= 1000 or offset < 0:
+            raise ValidationError("limit must be 1-1000 and offset must be non-negative")
+        result = await _get_client().search_logfiles(
+            adom=adom, devid=device, vdom=vdom, filename=filename, logtype=logtype,
+            filter=filter, case_sensitive=case_sensitive, limit=limit, offset=offset,
+        )
+        return {"status": "success", "adom": adom, "data": result}
+    except ValidationError as e:
+        return error_response(
+            error="validation_error", message=e, operation="search_archived_logs", adom=adom
+        )
+    except Exception as e:
+        logger.error(f"Failed to search archived logs: {e}")
+        return {"status": "error", "message": redact(str(e))}
+
+
+@mcp.tool(annotations=READ_ONLY)
+async def get_archived_log_data(
+    device: str,
+    vdom: str,
+    filename: str,
+    adom: str | None = None,
+    data_type: str = "base64",
+    offset: int = 0,
+    length: int = 1048576,
+) -> dict[str, Any]:
+    """Read a bounded byte range from an archived log file.
+
+    Use get_logfiles_state to discover filenames. Large files can be read with
+    repeated calls using the returned/requested offset and length.
+    """
+    try:
+        adom = validate_adom(adom or get_default_adom())
+        if not device or not vdom or not filename:
+            raise ValidationError("device, vdom, and filename are required")
+        if data_type not in {"base64", "csv/gzip/base64", "text/gzip/base64"}:
+            raise ValidationError("Unsupported data_type")
+        if offset < 0 or not 1 <= length <= 52428800:
+            raise ValidationError("offset must be non-negative and length must be 1-52428800")
+        result = await _get_client().get_logfiles_data(
+            adom=adom, devid=device, vdom=vdom, filename=filename,
+            data_type=data_type, offset=offset, length=length,
+        )
+        return {"status": "success", "adom": adom, "data": result}
+    except ValidationError as e:
+        return error_response(
+            error="validation_error", message=e, operation="get_archived_log_data", adom=adom
+        )
+    except Exception as e:
+        logger.error(f"Failed to read archived log data: {e}")
+        return {"status": "error", "message": redact(str(e))}
+
+
+@mcp.tool(annotations=READ_ONLY)
 async def get_pcap_file(
     log_data: str,
     key_type: str = "log-data",
